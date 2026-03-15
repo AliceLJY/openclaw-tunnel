@@ -1,0 +1,33 @@
+{
+  "name": "@openclaw/cli-bridge",
+  "version": "1.5.0",
+  "description": "Docker-first command entry plane for OpenClaw-compatible local CLI execution",
+  "type": "module",
+  "main": "./index.ts",
+  "license": "MIT",
+  "author": "AliceLJY",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/AliceLJY/openclaw-cli-bridge.git"
+  },
+  "keywords": [
+    "openclaw",
+    "claude-code",
+    "discord",
+    "bridge",
+    "plugin",
+    "docker",
+    "codex",
+    "gemini"
+  ],
+  "openclaw": {
+    "extensions": ["./index.ts"]
+  },
+  "scripts": {
+    "test": "bun test",
+    "doctor": "bash scripts/doctor.sh"
+  },
+  "devDependencies": {
+    "@types/node": "^25.3.5"
+  }
+}
