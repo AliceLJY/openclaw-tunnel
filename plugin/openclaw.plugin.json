@@ -1,0 +1,37 @@
+{
+  "id": "cli-bridge",
+  "name": "CLI Bridge",
+  "version": "1.5.0",
+  "description": "Docker-first command entry plane for OpenClaw-compatible local CLI execution",
+  "author": "AliceLJY",
+  "license": "MIT",
+  "entry": "./index.ts",
+  "configSchema": {
+    "type": "object",
+    "properties": {
+      "apiUrl": {
+        "type": "string",
+        "default": "http://host.docker.internal:3456",
+        "description": "Task API base URL (openclaw-worker endpoint)"
+      },
+      "apiToken": {
+        "type": "string",
+        "description": "Task API auth token (from openclaw-worker config)"
+      },
+      "callbackChannel": {
+        "type": "string",
+        "description": "Callback channel ID where CLI results are delivered"
+      },
+      "callbackBotToken": {
+        "type": "string",
+        "description": "Bot token used for callback delivery when the worker needs to post results back through a bot identity"
+      },
+      "sessionStorePath": {
+        "type": "string",
+        "default": "~/.openclaw-cli-bridge/state.db",
+        "description": "Path to persist CLI Bridge session mappings in SQLite across plugin restarts"
+      }
+    },
+    "required": []
+  }
+}

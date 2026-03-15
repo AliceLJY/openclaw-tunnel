@@ -1,0 +1,11 @@
+{
+  "name": "openclaw-tunnel-runner",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node worker.js"
+  },
+  "dependencies": {
+    "https-proxy-agent": "^7.0.6"
+  }
+}
