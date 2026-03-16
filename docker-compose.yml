@@ -1,0 +1,24 @@
+services:
+  task-api:
+    build:
+      context: ./task-api
+      dockerfile: Dockerfile
+    ports:
+      - "${PORT:-3456}:${PORT:-3456}"
+    environment:
+      - WORKER_TOKEN=${WORKER_TOKEN}
+      - PORT=${PORT:-3456}
+      - CALLBACK_BOT_TOKEN=${CALLBACK_BOT_TOKEN}
+      - CALLBACK_API_BASE_URL=${CALLBACK_API_BASE_URL:-https://discord.com/api/v10}
+      - WORKER_TASK_DB=/data/tasks.db
+    volumes:
+      - tunnel-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:${PORT:-3456}/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  tunnel-data:
