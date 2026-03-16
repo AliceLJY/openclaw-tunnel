@@ -25,6 +25,9 @@ const DEFAULT_POLL_WAIT_MS = 30000;
 const MAX_POLL_WAIT_MS = 60000;
 const MIN_TASK_TIMEOUT_MS = 1000;
 const MAX_TASK_TIMEOUT_MS = 24 * 60 * 60 * 1000;
+const MAX_EVENTS = parseBoundedInt(process.env.WORKER_MAX_EVENTS, 2000, { min: 100, max: 500000 });
+const EVENT_RETENTION_DAYS = parseBoundedInt(process.env.WORKER_EVENT_RETENTION_DAYS, 14, { min: 1, max: 3650 });
+const EVENT_DB_PATH = process.env.WORKER_EVENT_DB || '/tmp/openclaw-runner-events.db';
 const TASK_DB_PATH = process.env.WORKER_TASK_DB || '/data/tasks.db';
 const CALLBACK_API_BASE_URL = process.env.CALLBACK_API_BASE_URL || process.env.DISCORD_API_BASE_URL || 'https://discord.com/api/v10';
 const TASK_EXPIRE_MS = parseBoundedInt(process.env.WORKER_TASK_RETENTION_MS, 20 * 60 * 1000, {
@@ -48,6 +51,7 @@ if (!AUTH_TOKEN || AUTH_TOKEN === 'change-me-to-a-secure-token' || AUTH_TOKEN.le
 }
 
 // ========== 持久化任务状态 ==========
+let eventDb = null;
 let taskDb = null;
 
 // ========== 认证中间件 ==========
@@ -95,6 +99,32 @@ function extractDispatchMeta(body, defaultEntrypoint) {
   };
 }
 
+function getEventDb() {
+  if (eventDb) return eventDb;
+
+  fs.mkdirSync(path.dirname(EVENT_DB_PATH), { recursive: true });
+  eventDb = new DatabaseSync(EVENT_DB_PATH);
+  eventDb.exec(`
+    CREATE TABLE IF NOT EXISTS events (
+      id TEXT PRIMARY KEY,
+      type TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      task_id TEXT,
+      task_type TEXT,
+      task_status TEXT,
+      session_id TEXT,
+      origin TEXT,
+      dispatch_mode TEXT,
+      response_mode TEXT,
+      entrypoint TEXT,
+      details_json TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_events_created_at ON events(created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_events_task_id ON events(task_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_events_type ON events(type, created_at DESC);
+  `);
+  return eventDb;
+}
 
 function getTaskDb() {
   if (taskDb) return taskDb;
@@ -153,7 +183,7 @@ function deriveTaskType(task) {
 function deriveSessionKey(task) {
   if (!task?.sessionId) return null;
   const type = deriveTaskType(task);
-  if (type !== 'claude-cli') {
+  if (type !== 'claude-cli' && type !== 'codex-cli' && type !== 'gemini-cli') {
     return null;
   }
   return `${type}:${task.sessionId}`;
@@ -257,6 +287,8 @@ function getQueueStats() {
 
 function getSessionCliType(taskType) {
   if (taskType === 'claude-cli') return 'claude';
+  if (taskType === 'codex-cli') return 'codex';
+  if (taskType === 'gemini-cli') return 'gemini';
   return 'unknown';
 }
 
@@ -397,6 +429,196 @@ function resetStaleRunningTasks() {
   return staleRows.length;
 }
 
+function appendEvent(type, task, extra = {}) {
+  const event = {
+    id: crypto.randomUUID(),
+    type,
+    createdAt: Date.now(),
+    taskId: task?.id || extra.taskId || null,
+    taskType: task?.type || extra.taskType || null,
+    taskStatus: task?.status || extra.taskStatus || null,
+    sessionId: task?.sessionId || extra.sessionId || null,
+    origin: task?.origin || extra.origin || 'unknown',
+    dispatchMode: task?.dispatchMode || extra.dispatchMode || 'unspecified',
+    responseMode: task?.responseMode || extra.responseMode || 'direct-callback',
+    entrypoint: task?.entrypoint || extra.entrypoint || null,
+    details: extra.details || null,
+  };
+
+  const db = getEventDb();
+  db.prepare(`
+    INSERT INTO events (
+      id, type, created_at, task_id, task_type, task_status, session_id,
+      origin, dispatch_mode, response_mode, entrypoint, details_json
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    event.id,
+    event.type,
+    event.createdAt,
+    event.taskId,
+    event.taskType,
+    event.taskStatus,
+    event.sessionId,
+    event.origin,
+    event.dispatchMode,
+    event.responseMode,
+    event.entrypoint,
+    event.details ? JSON.stringify(event.details) : null
+  );
+
+  trimEvents();
+
+  return event;
+}
+
+function countEvents() {
+  const row = getEventDb().prepare(`SELECT COUNT(*) AS count FROM events`).get();
+  return Number(row?.count || 0);
+}
+
+function getEventDbSizeBytes() {
+  try {
+    return fs.statSync(EVENT_DB_PATH).size;
+  } catch {
+    return 0;
+  }
+}
+
+function trimEvents() {
+  const db = getEventDb();
+  const cutoff = Date.now() - (EVENT_RETENTION_DAYS * 24 * 60 * 60 * 1000);
+  const deletedExpired = db.prepare(`DELETE FROM events WHERE created_at < ?`).run(cutoff).changes;
+
+  const countRow = db.prepare(`SELECT COUNT(*) AS count FROM events`).get();
+  const count = Number(countRow?.count || 0);
+  const deletedOverflow = count > MAX_EVENTS
+    ? db.prepare(`
+      DELETE FROM events
+      WHERE id IN (
+        SELECT id FROM events
+        ORDER BY created_at DESC
+        LIMIT -1 OFFSET ?
+      )
+    `).run(MAX_EVENTS).changes
+    : 0;
+
+  return {
+    cutoff,
+    deletedExpired,
+    deletedOverflow,
+    count: countEvents(),
+  };
+}
+
+function vacuumEvents() {
+  getEventDb().exec('VACUUM');
+}
+
+function getEventStats() {
+  const db = getEventDb();
+  const totals = db.prepare(`
+    SELECT
+      COUNT(*) AS count,
+      MIN(created_at) AS oldest_created_at,
+      MAX(created_at) AS newest_created_at
+    FROM events
+  `).get();
+  const byTypeRows = db.prepare(`
+    SELECT type, COUNT(*) AS count
+    FROM events
+    GROUP BY type
+    ORDER BY count DESC, type ASC
+  `).all();
+  const byStatusRows = db.prepare(`
+    SELECT COALESCE(task_status, 'unknown') AS task_status, COUNT(*) AS count
+    FROM events
+    GROUP BY COALESCE(task_status, 'unknown')
+    ORDER BY count DESC, task_status ASC
+  `).all();
+
+  return {
+    path: EVENT_DB_PATH,
+    sizeBytes: getEventDbSizeBytes(),
+    count: Number(totals?.count || 0),
+    oldestCreatedAt: totals?.oldest_created_at ?? null,
+    newestCreatedAt: totals?.newest_created_at ?? null,
+    retentionDays: EVENT_RETENTION_DAYS,
+    maxEvents: MAX_EVENTS,
+    byType: byTypeRows.map((row) => ({
+      type: row.type,
+      count: Number(row.count || 0),
+    })),
+    byStatus: byStatusRows.map((row) => ({
+      taskStatus: row.task_status,
+      count: Number(row.count || 0),
+    })),
+  };
+}
+
+function runEventMaintenance({ vacuum = false } = {}) {
+  const before = getEventStats();
+  const trim = trimEvents();
+  if (vacuum) {
+    vacuumEvents();
+  }
+  const after = getEventStats();
+  return {
+    vacuumed: vacuum,
+    trim,
+    before,
+    after,
+  };
+}
+
+function listEvents({ limit, taskId, type }) {
+  const conditions = [];
+  const params = [];
+
+  if (taskId) {
+    conditions.push('task_id = ?');
+    params.push(taskId);
+  }
+  if (type) {
+    conditions.push('type = ?');
+    params.push(type);
+  }
+
+  const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+  const rows = getEventDb().prepare(`
+    SELECT
+      id,
+      type,
+      created_at,
+      task_id,
+      task_type,
+      task_status,
+      session_id,
+      origin,
+      dispatch_mode,
+      response_mode,
+      entrypoint,
+      details_json
+    FROM events
+    ${whereClause}
+    ORDER BY created_at DESC
+    LIMIT ?
+  `).all(...params, limit);
+
+  return rows.map((row) => ({
+    id: row.id,
+    type: row.type,
+    createdAt: row.created_at,
+    taskId: row.task_id,
+    taskType: row.task_type,
+    taskStatus: row.task_status,
+    sessionId: row.session_id,
+    origin: row.origin,
+    dispatchMode: row.dispatch_mode,
+    responseMode: row.response_mode,
+    entrypoint: row.entrypoint,
+    details: row.details_json ? JSON.parse(row.details_json) : null,
+  }));
+}
 
 function enqueueTask(payload) {
   const task = saveTask({
@@ -405,6 +627,7 @@ function enqueueTask(payload) {
     createdAt: Date.now(),
     ...payload
   });
+  appendEvent('task.created', task);
   return task;
 }
 
@@ -415,6 +638,16 @@ function getSerializedSessionKey(task) {
 function consumeTaskResult(taskId) {
   const result = getTaskResult(taskId);
   if (!result) return null;
+  const task = getTask(taskId);
+  appendEvent('task.reconciled', task, {
+    taskId,
+    taskStatus: task?.status || null,
+    sessionId: result?.metadata?.sessionId || task?.sessionId || null,
+    details: {
+      exitCode: result?.exitCode ?? null,
+      reconciledBy: 'task-result-fetch',
+    },
+  });
   const db = getTaskDb();
   db.prepare(`DELETE FROM task_results WHERE task_id = ?`).run(taskId);
   db.prepare(`DELETE FROM tasks WHERE id = ?`).run(taskId);
@@ -448,6 +681,7 @@ function claimNextPendingTask() {
     task.status = 'running';
     task.startedAt = Date.now();
     saveTask(task);
+    appendEvent('task.started', task);
     console.log(`[Worker] Picked up: ${task.id}`);
     return task;
   }
@@ -534,6 +768,7 @@ app.get('/health', (req, res) => {
     tasks: queue.total,
     results: queue.unconsumedResults,
     activeSessions: sessions.active,
+    events: countEvents(),
     taskDb: {
       path: queue.path,
       byStatus: queue.byStatus,
@@ -545,9 +780,36 @@ app.get('/health', (req, res) => {
       retentionMs: sessions.retentionMs,
       byType: sessions.byType,
     },
+    eventDb: {
+      path: EVENT_DB_PATH,
+      retentionDays: EVENT_RETENTION_DAYS,
+      maxEvents: MAX_EVENTS,
+      sizeBytes: getEventDbSizeBytes(),
+    },
   });
 });
 
+app.get('/events', auth, (req, res) => {
+  const limit = parseBoundedInt(req.query.limit, 50, { min: 1, max: 500 });
+  const taskId = normalizeOptionalString(req.query.taskId);
+  const type = normalizeOptionalString(req.query.type);
+
+  res.json({
+    events: listEvents({ limit, taskId, type }),
+  });
+});
+
+app.get('/events/stats', auth, (req, res) => {
+  res.json({
+    stats: getEventStats(),
+  });
+});
+
+app.post('/events/maintenance', auth, (req, res) => {
+  const vacuum = Boolean(req.body?.vacuum);
+  const result = runEventMaintenance({ vacuum });
+  res.json(result);
+});
 
 // [云端 OpenClaw 调用] 提交任务
 app.post('/tasks', auth, (req, res) => {
@@ -567,6 +829,21 @@ app.post('/tasks', auth, (req, res) => {
   res.json({ taskId: task.id, message: 'Task created, waiting for reconciler' });
 });
 
+app.get('/tasks/stats', auth, (req, res) => {
+  res.json({
+    queue: {
+      ...getQueueStats(),
+      taskRetentionMs: TASK_EXPIRE_MS,
+      resultRetentionMs: RESULT_EXPIRE_MS,
+    },
+  });
+});
+
+app.get('/sessions/stats', auth, (req, res) => {
+  res.json({
+    sessions: getSessionStats(),
+  });
+});
 
 app.get('/sessions/state', auth, (req, res) => {
   const limit = parseBoundedInt(req.query.limit, 50, { min: 1, max: 500 });
@@ -665,6 +942,16 @@ app.post('/worker/result', auth, (req, res) => {
     saveTask(task);
   }
 
+  appendEvent(result.exitCode === 0 ? 'task.completed' : 'task.failed', task, {
+    taskId,
+    taskStatus: task?.status || (result.exitCode === 0 ? 'completed' : 'failed'),
+    details: {
+      exitCode: result.exitCode,
+      error: result.error,
+    },
+    ...(result.metadata?.sessionId ? { sessionId: result.metadata.sessionId } : {}),
+  });
+
   saveTaskResult(taskId, result);
   console.log(`[Worker] Result: ${taskId} - exit ${exitCode}`);
   if (metadata?.screenshotPath) {
@@ -684,7 +971,92 @@ app.post('/worker/result', auth, (req, res) => {
   res.json({ success: true });
 });
 
+app.post('/worker/event', auth, (req, res) => {
+  const { taskId, type, details, metadata } = req.body || {};
+  const normalizedType = normalizeOptionalString(type);
+  if (!normalizedType) {
+    return res.status(400).json({ error: 'type is required' });
+  }
 
+  const task = taskId ? getTask(taskId) : null;
+  const event = appendEvent(normalizedType, task, {
+    taskId: taskId || null,
+    taskType: metadata?.taskType || null,
+    taskStatus: metadata?.taskStatus || task?.status || null,
+    sessionId: metadata?.sessionId || task?.sessionId || null,
+    origin: metadata?.origin || task?.origin || 'unknown',
+    dispatchMode: metadata?.dispatchMode || task?.dispatchMode || 'unspecified',
+    responseMode: metadata?.responseMode || task?.responseMode || 'direct-callback',
+    entrypoint: metadata?.entrypoint || task?.entrypoint || null,
+    details: details || null,
+  });
+
+  res.json({ success: true, event });
+});
+
+// ========== 文件写入 API（绕过 shell 转义问题） ==========
+
+// [云端 OpenClaw 调用] 写入文件
+app.post('/files/write', auth, (req, res) => {
+  const { path, content, encoding = 'utf8' } = req.body || {};
+  const normalizedPath = normalizeString(path);
+
+  if (!normalizedPath || content === undefined) {
+    return res.status(400).json({ error: 'path and content are required' });
+  }
+
+  const task = enqueueTask({
+    type: 'file-write',
+    path: normalizedPath,
+    content,
+    encoding, // 'utf8' 或 'base64'
+  });
+
+  console.log(`[File] Write: ${task.id} - ${normalizedPath}`);
+
+  res.json({ taskId: task.id, message: 'File write task created' });
+});
+
+// [云端 OpenClaw 调用] 读取文件
+app.post('/files/read', auth, (req, res) => {
+  const { path } = req.body || {};
+  const normalizedPath = normalizeString(path);
+
+  if (!normalizedPath) {
+    return res.status(400).json({ error: 'path is required' });
+  }
+
+  const task = enqueueTask({
+    type: 'file-read',
+    path: normalizedPath,
+  });
+
+  console.log(`[File] Read: ${task.id} - ${normalizedPath}`);
+
+  res.json({ taskId: task.id, message: 'File read task created' });
+});
+
+// [云端 OpenClaw 调用] 编辑文件（局部替换）
+app.post('/files/edit', auth, (req, res) => {
+  const { path, old_string, new_string, replace_all = false } = req.body || {};
+  const normalizedPath = normalizeString(path);
+
+  if (!normalizedPath || old_string === undefined || new_string === undefined) {
+    return res.status(400).json({ error: 'path, old_string, new_string are required' });
+  }
+
+  const task = enqueueTask({
+    type: 'file-edit',
+    path: normalizedPath,
+    oldString: old_string,
+    newString: new_string,
+    replaceAll: replace_all,
+  });
+
+  console.log(`[File] Edit: ${task.id} - ${normalizedPath}`);
+
+  res.json({ taskId: task.id, message: 'File edit task created' });
+});
 
 // ========== Claude CLI API（调用本地 Claude Code） ==========
 
@@ -725,6 +1097,78 @@ app.post('/claude', auth, (req, res) => {
   res.json({ taskId: task.id, sessionId: effectiveSessionId, message: 'Claude CLI task created' });
 });
 
+// ========== Codex / Gemini CLI API ==========
+
+// [Discord/Telegram bridge 调用] 提交 Codex CLI 任务（支持 session）
+app.post('/codex', auth, (req, res) => {
+  const { prompt, timeout = 300000, sessionId, model, callbackChannel, callbackBotToken } = req.body || {};
+  const promptText = typeof prompt === 'string' ? prompt : '';
+  const normalizedSessionId = normalizeOptionalString(sessionId);
+  const dispatchMeta = extractDispatchMeta(req.body, 'codex');
+
+  if (!promptText.trim()) {
+    return res.status(400).json({ error: 'prompt is required' });
+  }
+
+  const effectiveSessionId = normalizedSessionId || crypto.randomUUID();
+  const task = enqueueTask({
+    type: 'codex-cli',
+    prompt: promptText,
+    timeout: parseTaskTimeout(timeout, 300000),
+    sessionId: effectiveSessionId,
+    model: normalizeOptionalString(model),
+    callbackChannel: normalizeOptionalString(callbackChannel),
+    callbackBotToken: normalizeOptionalString(callbackBotToken),
+    ...dispatchMeta,
+  });
+  touchSession(effectiveSessionId, {
+    cliType: 'codex',
+    callbackChannel: task.callbackChannel,
+    incrementTaskCount: true,
+    timestamp: Date.now(),
+  });
+
+  const isResume = Boolean(normalizedSessionId);
+  console.log(`[Codex] Task: ${task.id} [mode:${task.dispatchMode}] [session:${effectiveSessionId.slice(0, 8)}${isResume ? ',resume' : ',new'}]${task.model ? ' [' + task.model + ']' : ''}${task.callbackChannel ? ' [callback:' + task.callbackChannel + ']' : ''}${task.entrypoint ? ' [via:' + task.entrypoint + ']' : ''} - ${previewText(promptText)}`);
+
+  res.json({ taskId: task.id, sessionId: effectiveSessionId, message: 'Codex CLI task created' });
+});
+
+// [Discord/Telegram bridge 调用] 提交 Gemini CLI 任务（支持 session）
+app.post('/gemini', auth, (req, res) => {
+  const { prompt, timeout = 300000, sessionId, resumeLatest, model, callbackChannel, callbackBotToken } = req.body || {};
+  const promptText = typeof prompt === 'string' ? prompt : '';
+  const normalizedSessionId = normalizeOptionalString(sessionId);
+  const dispatchMeta = extractDispatchMeta(req.body, 'gemini');
+
+  if (!promptText.trim()) {
+    return res.status(400).json({ error: 'prompt is required' });
+  }
+
+  const effectiveSessionId = normalizedSessionId || crypto.randomUUID();
+  const task = enqueueTask({
+    type: 'gemini-cli',
+    prompt: promptText,
+    timeout: parseTaskTimeout(timeout, 300000),
+    sessionId: effectiveSessionId,
+    resumeLatest: Boolean(resumeLatest) || Boolean(normalizedSessionId),
+    model: normalizeOptionalString(model),
+    callbackChannel: normalizeOptionalString(callbackChannel),
+    callbackBotToken: normalizeOptionalString(callbackBotToken),
+    ...dispatchMeta,
+  });
+  touchSession(effectiveSessionId, {
+    cliType: 'gemini',
+    callbackChannel: task.callbackChannel,
+    incrementTaskCount: true,
+    timestamp: Date.now(),
+  });
+
+  const isResume = task.resumeLatest;
+  console.log(`[Gemini] Task: ${task.id} [mode:${task.dispatchMode}] [session:${effectiveSessionId.slice(0, 8)}${isResume ? ',resume-latest' : ',new'}]${task.callbackChannel ? ' [callback:' + task.callbackChannel + ']' : ''}${task.entrypoint ? ' [via:' + task.entrypoint + ']' : ''} - ${previewText(promptText)}`);
+
+  res.json({ taskId: task.id, sessionId: effectiveSessionId, message: 'Gemini CLI task created' });
+});
 
 // ========== Bot callback push (current compatibility path defaults to Discord API) ==========
 
@@ -827,6 +1271,74 @@ app.get('/claude/recent', auth, async (req, res) => {
   res.json({ sessions: results });
 });
 
+// [本地调用] 列出最近的 Codex 会话（含话题摘要）
+app.get('/codex/recent', auth, async (req, res) => {
+  const limit = parseRecentLimit(req.query.limit);
+  const { fs, path, readline } = await loadSessionModules();
+
+  // 扫描 Codex session 文件（容器内挂载路径，宿主机 ~/.codex/sessions）
+  // 目录结构：YYYY/MM/DD/rollout-{timestamp}-{uuid}.jsonl
+  const sessionsDir = '/host-codex-sessions';
+  const sessionFiles = [];
+
+  try {
+    // 只扫最近 7 天的目录
+    const now = new Date();
+    for (let d = 0; d < 7; d++) {
+      const date = new Date(now - d * 86400000);
+      const yyyy = String(date.getFullYear());
+      const mm = String(date.getMonth() + 1).padStart(2, '0');
+      const dd = String(date.getDate()).padStart(2, '0');
+      const dayDir = path.join(sessionsDir, yyyy, mm, dd);
+
+      try {
+        const files = fs.readdirSync(dayDir)
+          .filter(f => f.endsWith('.jsonl'))
+          .map(f => {
+            const fp = path.join(dayDir, f);
+            const stat = fs.statSync(fp);
+            // 从文件名提取末尾 UUID（兼容 rollout-2026-03-02T12-33-14-{uuid}.jsonl）
+            const uuidMatch = f.match(/([0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.jsonl$/i);
+            const sessionId = uuidMatch ? uuidMatch[1] : f.replace('.jsonl', '');
+            return { file: f, path: fp, mtime: stat.mtimeMs, size: stat.size, sessionId };
+          });
+        sessionFiles.push(...files);
+      } catch { /* 该天目录不存在，跳过 */ }
+    }
+  } catch (e) {
+    return res.json({ sessions: [], error: errorMessage(e) });
+  }
+
+  // 按修改时间倒序，取最近 N 个
+  sessionFiles.sort((a, b) => b.mtime - a.mtime);
+  const recent = sessionFiles.slice(0, limit);
+
+  // 提取每个会话的第一条 user 消息作为话题
+  const results = [];
+  for (const s of recent) {
+    const topic = await extractSessionTopic(s.path, fs, readline, (record) => {
+      if (record.type === 'event_msg' && record.payload?.type === 'user_message') {
+        const message = normalizeString(record.payload.message);
+        if (!message) return '';
+        const isSlashCommand = /^\/[a-z0-9_]+(?:@\w+)?(?:\s|$)/i.test(message);
+        const isMentionCommand = /^@\S+\s+\/[a-z0-9_]+(?:@\w+)?(?:\s|$)/i.test(message);
+        if (isSlashCommand || isMentionCommand) return '';
+        return message.slice(0, 150);
+      }
+      if (record.message?.role !== 'user') return '';
+      return extractUserText(record.message.content);
+    });
+
+    results.push({
+      sessionId: s.sessionId,
+      lastModified: new Date(s.mtime).toISOString(),
+      sizeKB: Math.round(s.size / 1024),
+      topic,
+    });
+  }
+
+  res.json({ sessions: results });
+});
 
 // ========== 清理过期任务 ==========
 setInterval(() => {
@@ -856,16 +1368,19 @@ setInterval(() => {
   }
 
   cleanupExpiredSessions();
+  trimEvents();
 }, 60000);
 
 // ========== 启动 ==========
 app.listen(PORT, '0.0.0.0', () => {
   const requeued = resetStaleRunningTasks();
   const queue = getQueueStats();
+  trimEvents();
   console.log(`✅ Task API running on :${PORT}`);
   console.log(`   Token : ${AUTH_TOKEN.slice(0, 4)}${'*'.repeat(AUTH_TOKEN.length - 4)}`);
   console.log(`   Notify: ${process.env.CALLBACK_BOT_TOKEN || process.env.DISCORD_BOT_TOKEN ? '✓ CALLBACK_BOT_TOKEN/DISCORD_BOT_TOKEN set' : '✗ no CALLBACK_BOT_TOKEN or DISCORD_BOT_TOKEN'}`);
   console.log(`   Tasks : ${TASK_DB_PATH} | total=${queue.total} | results=${queue.unconsumedResults}`);
+  console.log(`   Events: ${EVENT_DB_PATH} | retention=${EVENT_RETENTION_DAYS}d | max=${MAX_EVENTS}`);
   if (requeued > 0) {
     console.log(`   Requeue: reset ${requeued} stale running task(s) to pending`);
   }
