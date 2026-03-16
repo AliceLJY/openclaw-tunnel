@@ -140,6 +140,12 @@ The runner sits on the host behind NAT — `task-api` inside Docker cannot push 
 
 ---
 
+## Author
+
+Built by [AliceLJY](https://github.com/AliceLJY) — a non-programmer who builds AI agent infrastructure with Claude Code. Writes about the journey at WeChat public account "我的AI小木屋" (My AI Cabin).
+
+This project grew out of real-world pain: running five OpenClaw bots in Docker while needing Claude Code, Codex, and Gemini on the host. The original multi-runner setup lives in [openclaw-worker](https://github.com/AliceLJY/openclaw-worker) and [openclaw-cli-bridge](https://github.com/AliceLJY/openclaw-cli-bridge).
+
 ## License
 
 MIT
