@@ -14,20 +14,21 @@
     "openclaw",
     "claude-code",
     "discord",
-    "bridge",
+    "tunnel",
     "plugin",
-    "docker",
-    "codex",
-    "gemini"
+    "docker"
   ],
   "openclaw": {
-    "extensions": ["./index.ts"]
+    "extensions": [
+      "./index.ts"
+    ]
   },
   "scripts": {
     "test": "bun test",
     "doctor": "bash scripts/doctor.sh"
   },
   "devDependencies": {
-    "@types/node": "^25.3.5"
+    "@types/node": "^25.3.5",
+    "typescript": "^5.9.3"
   }
 }
