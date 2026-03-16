@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 /**
  * Mac 本地 Runner / Reconciler
- * Agent SDK 版本：流式输出 + 会话管理
+ * Claude CLI 版本：直接 spawn child_process
  *
  * 运行: npm run runner
- * 或: WORKER_URL=https://xxx WORKER_TOKEN=xxx npm run runner
+ * 或: WORKER_URL=http://127.0.0.1:3456 WORKER_TOKEN=xxx npm run runner
  */
 
 import { exec, spawn, execFile } from 'child_process';
@@ -25,16 +25,6 @@ function parseConfigInt(value, fallback, min = 1, max = Number.MAX_SAFE_INTEGER)
   return parsed;
 }
 
-// ========== Agent SDK 加载（失败则回退 CLI） ==========
-let sdkQuery;
-try {
-  const sdk = await import('@anthropic-ai/claude-agent-sdk');
-  sdkQuery = sdk.query;
-  console.log('[SDK] Agent SDK 加载成功');
-} catch (e) {
-  console.warn(`[SDK] Agent SDK 加载失败，将使用 CLI 模式: ${e.message}`);
-}
-
 // ========== 配置 ==========
 const CONFIG = {
   // 云端任务 API 地址（改成你的腾讯云服务器）
@@ -47,7 +37,7 @@ const CONFIG = {
   longPollWait: parseConfigInt(process.env.LONG_POLL_WAIT, 30000, 1000, 300000),
   // 最大并发任务数
   maxConcurrent: parseConfigInt(process.env.MAX_CONCURRENT, 5, 1, 50),
-  // 命令执行超时（毫秒）- 10分钟，适配 Gemini/Codex 慢任务
+  // 命令执行超时（毫秒）- 10分钟
   defaultTimeout: 600000,
   // OpenClaw Hooks 回调配置（CC 完成后通知 bot）
   openclawHooksUrl: process.env.OPENCLAW_HOOKS_URL || 'http://127.0.0.1:18791',
@@ -67,7 +57,7 @@ console.log('========================================');
 console.log(`Task API: ${CONFIG.serverUrl}`);
 console.log(`调和等待窗口: ${CONFIG.longPollWait}ms`);
 console.log(`最大并发: ${CONFIG.maxConcurrent} 个任务`);
-console.log(`执行模式: ${sdkQuery ? 'Agent SDK (优先)' : 'CLI (回退)'}`);
+console.log(`执行模式: CLI`);
 console.log(`Runner cache: ${CONFIG.runnerSessionCacheFile}`);
 console.log('');
 console.log('支持的任务类型:');
@@ -75,9 +65,7 @@ console.log('  - command: 执行 shell 命令');
 console.log('  - file-read: 读取文件');
 console.log('  - file-write: 写入文件');
 console.log('  - file-edit: 编辑文件（局部替换）');
-console.log('  - claude-cli: 调用本地 Claude Code (SDK/CLI)');
-console.log('  - codex-cli: 调用本地 Codex CLI');
-console.log('  - gemini-cli: 调用本地 Gemini CLI');
+console.log('  - claude-cli: 调用本地 Claude Code CLI');
 console.log('');
 
 // ========== HTTP 请求封装 ==========
@@ -300,57 +288,6 @@ function rememberMappedSession(taskApiId, providerSessionId, callbackChannel) {
   saveSessions();
 }
 
-function listRecentCodexSessions(days = 30) {
-  const sessionsDir = path.join(process.env.HOME, '.codex', 'sessions');
-  const sessionFiles = [];
-  const now = new Date();
-
-  for (let d = 0; d < days; d++) {
-    const date = new Date(now.getTime() - d * 86400000);
-    const yyyy = String(date.getFullYear());
-    const mm = String(date.getMonth() + 1).padStart(2, '0');
-    const dd = String(date.getDate()).padStart(2, '0');
-    const dayDir = path.join(sessionsDir, yyyy, mm, dd);
-
-    try {
-      const files = fs.readdirSync(dayDir)
-        .filter(f => f.endsWith('.jsonl'))
-        .map(f => {
-          const fp = path.join(dayDir, f);
-          const stat = fs.statSync(fp);
-          const uuidMatch = f.match(/([0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.jsonl$/i);
-          const sessionId = uuidMatch ? uuidMatch[1] : f.replace('.jsonl', '');
-          return { sessionId, mtime: stat.mtimeMs };
-        });
-      sessionFiles.push(...files);
-    } catch {
-      // 该天目录不存在，跳过
-    }
-  }
-
-  return sessionFiles;
-}
-
-function resolveCodexSessionId(sessionId) {
-  if (!sessionId) return null;
-
-  const mapped = sessionIdMap.get(sessionId);
-  if (mapped) return mapped;
-
-  const candidates = listRecentCodexSessions()
-    .filter(s => s.sessionId === sessionId || s.sessionId.startsWith(sessionId))
-    .sort((a, b) => b.mtime - a.mtime);
-
-  if (candidates.length > 0) {
-    if (candidates[0].sessionId !== sessionId) {
-      console.log(`[Codex Session] 前缀匹配: ${sessionId} → ${candidates[0].sessionId}`);
-    }
-    return candidates[0].sessionId;
-  }
-
-  return null;
-}
-
 // 短 ID 前缀匹配：/cc-recent 显示 8 位截断 ID，resume 需要完整 UUID
 function resolveSessionPrefix(prefix) {
   if (!prefix) return prefix;
@@ -503,395 +440,8 @@ function notifyDiscord(callbackChannel, sessionId, text, prefix, botToken) {
   trySend();
 }
 
-// ========== 消息过滤 & 格式化（SDK 模式用） ==========
-const SILENT_TOOLS = new Set([
-  'TodoWrite', 'TaskCreate', 'TaskUpdate', 'TaskList', 'TaskGet'
-]);
-
-const READ_ONLY_TOOLS = new Set([
-  'Read', 'Glob', 'Grep', 'WebFetch', 'WebSearch'
-]);
-
-function formatAssistantMessage(msg) {
-  if (msg.type !== 'assistant' || !msg.message?.content) return null;
-
-  const parts = [];
-
-  for (const block of msg.message.content) {
-    if (block.type === 'text' && block.text) {
-      parts.push(block.text);
-    } else if (block.type === 'tool_use') {
-      if (SILENT_TOOLS.has(block.name)) continue;
-      if (READ_ONLY_TOOLS.has(block.name)) continue;
-      const inputPreview = typeof block.input === 'object'
-        ? (block.input.command || block.input.file_path || block.input.description || '').slice(0, 80)
-        : '';
-      parts.push(`🔧 ${block.name}${inputPreview ? ': ' + inputPreview : ''}`);
-    }
-  }
-
-  return parts.length > 0 ? parts.join('\n') : null;
-}
-
-// ========== Agent SDK 执行 ==========
-async function executeClaudeSDK(prompt, timeout, sessionId, callbackChannel, model) {
-  const startTime = Date.now();
-
-  // 判断 sessionId 是否对应一个真实的 CC session 文件（终端开的会话）
-  // 如果是，直接用它做 resume，不走 sessionIdMap（避免脏映射覆盖）
-  let sdkSessionId = null;
-  if (sessionId) {
-    const projectDir = path.join(process.env.HOME, '.claude', 'projects', '-Users-' + path.basename(process.env.HOME));
-    const sessionFile = path.join(projectDir, sessionId + '.jsonl');
-    if (fs.existsSync(sessionFile)) {
-      // 真实 CC session 文件存在 → 直接 resume 这个终端会话
-      sdkSessionId = sessionId;
-    } else {
-      // 精确文件不存在 → 先尝试短 ID 前缀匹配
-      if (!sessionId.includes('-') || sessionId.length < 36) {
-        try {
-          const matches = fs.readdirSync(projectDir)
-            .filter(f => f.startsWith(sessionId) && f.endsWith('.jsonl'));
-          if (matches.length === 1) {
-            sdkSessionId = matches[0].replace('.jsonl', '');
-            console.log(`[SDK] 短 ID 前缀匹配: ${sessionId} → ${sdkSessionId.slice(0, 8)}...`);
-          } else if (matches.length > 1) {
-            console.warn(`[SDK] 短 ID ${sessionId} 匹配到 ${matches.length} 个 session，跳过`);
-          }
-        } catch { /* projectDir 不存在 */ }
-      }
-      // 前缀也没匹配到 → 走 sessionIdMap 映射
-      if (!sdkSessionId) {
-        sdkSessionId = sessionIdMap.get(sessionId) || null;
-        if (!sdkSessionId) {
-          // 从文件重新加载映射（其他 worker 进程可能已写入）
-          try {
-            const data = JSON.parse(fs.readFileSync(SESSION_FILE, 'utf8'));
-            for (const s of data) {
-              if (s.taskApiId && s.sessionId) {
-                sessionIdMap.set(s.taskApiId, s.sessionId);
-                if (!liveSessions.has(s.sessionId)) {
-                  liveSessions.set(s.sessionId, { lastActivity: s.lastActivity, callbackChannel: s.callbackChannel });
-                }
-              }
-            }
-            sdkSessionId = sessionIdMap.get(sessionId) || null;
-            if (sdkSessionId) console.log(`[SDK] 从文件恢复映射: API:${sessionId.slice(0, 8)} → SDK:${sdkSessionId.slice(0, 8)}`);
-          } catch { /* 文件不存在或格式错误 */ }
-        }
-      }
-    }
-  }
-  const isResume = !!sdkSessionId;
-
-  console.log(`[SDK] ${isResume ? '续接' : '新建'}会话: "${prompt.slice(0, 50)}..."${sessionId ? ' [API:' + sessionId.slice(0, 8) + (sdkSessionId ? ' → SDK:' + sdkSessionId.slice(0, 8) : '') + ']' : ''}`);
-
-  // 构建 options（resume 也需要权限配置，否则子进程立即退出）
-  // model 由调用方传入，支持 fallback 重试
-  const baseOptions = {
-    model: model || 'claude-opus-4-6',
-    permissionMode: 'bypassPermissions',
-    allowDangerouslySkipPermissions: true,
-    cwd: process.env.HOME,
-  };
-  const options = isResume
-    ? { ...baseOptions, resume: sdkSessionId }
-    : {
-        ...baseOptions,
-        settingSources: ['user', 'project', 'local'],
-        systemPrompt: { type: 'preset', preset: 'claude_code' },
-      };
-
-  // 流式输出 debounce
-  let buffer = [];
-  let debounceTimer = null;
-  const DEBOUNCE_MS = 3000;
-  let capturedSessionId = sessionId || null;
-
-  function flush() {
-    // 不推流式进度到 bot chat，保持干净的聊天体验
-    buffer = [];
-    debounceTimer = null;
-  }
-
-  let resultText = '';
-  let resultSubtype = 'success';
-  let resultErrors = [];
-
-  // 超时保护
-  const timeoutMs = (timeout || CONFIG.defaultTimeout) + 30000;
-  const abortController = new AbortController();
-  const timeoutHandle = setTimeout(() => {
-    abortController.abort();
-  }, timeoutMs);
-
-  try {
-    for await (const message of sdkQuery({
-      prompt,
-      options: { ...options, abortController }
-    })) {
-      // 捕获 session ID
-      if (message.type === 'system' && message.subtype === 'init') {
-        capturedSessionId = message.session_id;
-        console.log(`[SDK] 会话 ID: ${capturedSessionId.slice(0, 8)}`);
-      }
-
-      // 格式化 assistant 消息
-      if (message.type === 'assistant') {
-        const formatted = formatAssistantMessage(message);
-        if (formatted) {
-          buffer.push(formatted);
-          if (!debounceTimer) {
-            debounceTimer = setTimeout(flush, DEBOUNCE_MS);
-          }
-        }
-      }
-
-      // 捕获最终结果
-      if (message.type === 'result') {
-        resultSubtype = message.subtype;
-        if (message.subtype === 'success') {
-          resultText = message.result || '';
-        } else {
-          resultErrors = message.errors || [];
-          resultText = resultErrors.join('\n');
-        }
-        console.log(`[SDK] 结果: ${message.subtype}, 耗时 ${message.duration_ms}ms, 花费 $${message.total_cost_usd?.toFixed(4) || '?'}`);
-      }
-    }
-  } catch (err) {
-    clearTimeout(timeoutHandle);
-    if (debounceTimer) clearTimeout(debounceTimer);
-    flush();
-
-    const isAbort = err.name === 'AbortError' || abortController.signal.aborted;
-    console.error(`[SDK] ${isAbort ? '超时' : '错误'}: ${err.message}`);
-
-    return {
-      stdout: resultText || '',
-      stderr: isAbort ? 'Timeout' : err.message,
-      exitCode: isAbort ? -1 : 1,
-      error: isAbort ? 'Timeout' : err.message,
-      duration: Date.now() - startTime,
-      metadata: capturedSessionId ? { sessionId: capturedSessionId } : undefined
-    };
-  }
-
-  clearTimeout(timeoutHandle);
-  if (debounceTimer) clearTimeout(debounceTimer);
-  buffer = [];   // 清空残余，避免与 notifyCompletion 重复发送
-  flush();
-
-  const duration = Date.now() - startTime;
-
-  // 更新会话池 + 映射表
-  if (capturedSessionId) {
-    liveSessions.set(capturedSessionId, {
-      lastActivity: Date.now(),
-      callbackChannel
-    });
-    // Task API sessionId → SDK session_id 映射
-    if (sessionId && sessionId !== capturedSessionId) {
-      sessionIdMap.set(sessionId, capturedSessionId);
-      console.log(`[SDK] 映射: API:${sessionId.slice(0, 8)} → SDK:${capturedSessionId.slice(0, 8)}`);
-    }
-    ccSessions.add(capturedSessionId);
-    saveSessions();
-  }
-
-  const isError = resultSubtype !== 'success';
-  console.log(`[SDK] 完成，耗时 ${duration}ms，结果 ${resultText.length} 字符`);
-
-  return {
-    stdout: resultText,
-    stderr: isError ? resultErrors.join('\n') : '',
-    exitCode: isError ? 1 : 0,
-    error: isError ? `SDK ${resultSubtype}` : null,
-    duration,
-    metadata: capturedSessionId ? { sessionId: capturedSessionId } : undefined
-  };
-}
-
-// ========== Codex CLI 执行（支持 session 续接 + 指定模型）==========
-function executeCodexCLI(prompt, timeout, sessionId, model) {
-  return new Promise((resolve) => {
-    const startTime = Date.now();
-    const resolvedSessionId = resolveCodexSessionId(sessionId);
-    console.log(`[Codex CLI] 执行${model ? ' [' + model + ']' : ''}: "${prompt.slice(0, 50)}..."${resolvedSessionId ? ' [resume:' + resolvedSessionId.slice(0, 8) + ']' : ''}`);
-
-    const args = ['exec'];
-    if (resolvedSessionId) {
-      args.push('resume');
-    }
-    args.push('--skip-git-repo-check', '--full-auto');
-    if (model) args.push('-m', model);
-    if (resolvedSessionId) args.push(resolvedSessionId);
-    args.push(prompt);
-
-    const child = spawn(CODEX_PATH, args, {
-      cwd: process.env.HOME,
-      env: buildCliEnv(),
-      stdio: ['ignore', 'pipe', 'pipe']
-    });
-
-    let stdout = '';
-    let stderr = '';
-
-    child.stdout.on('data', (data) => { stdout += data.toString(); });
-    child.stderr.on('data', (data) => { stderr += data.toString(); });
-
-    const effectiveTimeout = (timeout || CONFIG.defaultTimeout) + 30000;
-    const timer = setTimeout(() => {
-      child.kill();
-      resolve({
-        stdout, stderr: 'Timeout', exitCode: -1,
-        error: 'Timeout', duration: Date.now() - startTime
-      });
-    }, effectiveTimeout);
-
-    child.on('close', (code) => {
-      clearTimeout(timer);
-      const duration = Date.now() - startTime;
-      // 从 stderr 提取 session id（格式：session id: <uuid>）
-      const sessionMatch = stderr.match(/session id:\s*([a-f0-9-]+)/i);
-      const capturedSessionId = sessionMatch ? sessionMatch[1] : null;
-      console.log(`[Codex CLI] 完成，耗时 ${duration}ms，输出 ${stdout.length} 字节${capturedSessionId ? '，session:' + capturedSessionId.slice(0, 8) : ''}`);
-      resolve({
-        stdout: stdout.trim(), stderr: stderr.trim(),
-        exitCode: code || 0, error: code ? `Exit code ${code}` : null, duration,
-        metadata: capturedSessionId ? { sessionId: capturedSessionId } : undefined
-      });
-    });
-
-    child.on('error', (err) => {
-      clearTimeout(timer);
-      resolve({
-        stdout, stderr: err.message, exitCode: -1,
-        error: err.message, duration: Date.now() - startTime
-      });
-    });
-  });
-}
-
-// ========== Gemini CLI 执行（支持 session 续接）==========
-const DEFAULT_GEMINI_REPLY_HINT = [
-  'You are replying to an end user inside a chat bot.',
-  'Answer the user request directly, naturally, and helpfully.',
-  'Do not describe yourself as a CLI tool, non-interactive agent, runtime, or execution environment unless the user explicitly asks about that.',
-  'Do not add meta commentary about how you were invoked.',
-  'If the user asks who you are, answer as an AI assistant in this chat and briefly say what you can help with.',
-].join(' ');
-
-function buildGeminiPrompt(prompt) {
-  const hint = process.env.GEMINI_REPLY_HINT;
-  if (hint === 'off') return prompt;
-  const effectiveHint = (hint || DEFAULT_GEMINI_REPLY_HINT).trim();
-  if (!effectiveHint) return prompt;
-  return [
-    'System instructions:',
-    effectiveHint,
-    '',
-    'User message:',
-    prompt,
-    '',
-    'Reply:'
-  ].join('\n');
-}
-
-function sanitizeGeminiResponse(responseText) {
-  const text = (responseText || '').trim();
-  if (!text) return text;
-
-  const exactMetaPatterns = [
-    /^我是一个非交互式命令行代理[。.!！]?$/i,
-    /^我是一个非交互式cli代理[。.!！]?$/i,
-    /^我是一个cli代理[。.!！]?$/i,
-    /^i am a non-interactive command-line agent[.!]?$/i,
-    /^i am a non-interactive cli agent[.!]?$/i,
-    /^i am a cli agent[.!]?$/i,
-  ];
-
-  if (exactMetaPatterns.some((pattern) => pattern.test(text))) {
-    return /[一-龥]/.test(text) ? '我是一个 AI 助手。' : 'I am an AI assistant.';
-  }
-
-  return text
-    .replace(/^我是一个非交互式命令行代理[。.!！]?\s*/i, '我是一个 AI 助手。')
-    .replace(/^我是一个非交互式cli代理[。.!！]?\s*/i, '我是一个 AI 助手。')
-    .replace(/^我是一个cli代理[。.!！]?\s*/i, '我是一个 AI 助手。')
-    .replace(/^I am a non-interactive command-line agent[.!]?\s*/i, 'I am an AI assistant. ')
-    .replace(/^I am a non-interactive CLI agent[.!]?\s*/i, 'I am an AI assistant. ')
-    .replace(/^I am a CLI agent[.!]?\s*/i, 'I am an AI assistant. ')
-    .trim();
-}
-
-function executeGeminiCLI(prompt, timeout, resumeLatest, model) {
-  return new Promise((resolve) => {
-    const startTime = Date.now();
-    const modelName = model || 'gemini-2.5-flash';
-    console.log(`[Gemini CLI] 执行 [${modelName}]: "${prompt.slice(0, 50)}..."${resumeLatest ? ' [resume:latest]' : ''}`);
-    const wrappedPrompt = buildGeminiPrompt(prompt);
-
-    const args = [];
-    if (resumeLatest) {
-      args.push('--resume', 'latest');
-    }
-    args.push('-m', modelName, '-p', wrappedPrompt, '-o', 'json', '--sandbox=false');
-    const child = spawn(GEMINI_PATH, args, {
-      cwd: process.env.HOME,
-      env: buildCliEnv(),
-      stdio: ['ignore', 'pipe', 'pipe']
-    });
-
-    let stdout = '';
-    let stderr = '';
-
-    child.stdout.on('data', (data) => { stdout += data.toString(); });
-    child.stderr.on('data', (data) => { stderr += data.toString(); });
-
-    const effectiveTimeout = (timeout || CONFIG.defaultTimeout) + 30000;
-    const timer = setTimeout(() => {
-      child.kill();
-      resolve({
-        stdout, stderr: 'Timeout', exitCode: -1,
-        error: 'Timeout', duration: Date.now() - startTime
-      });
-    }, effectiveTimeout);
-
-    child.on('close', (code) => {
-      clearTimeout(timer);
-      const duration = Date.now() - startTime;
-      // 从 json 输出提取 session_id 和 response
-      let capturedSessionId = null;
-      let responseText = stdout.trim();
-      try {
-        const json = JSON.parse(stdout);
-        capturedSessionId = json.session_id || null;
-        responseText = json.response || responseText;
-      } catch {}
-      responseText = sanitizeGeminiResponse(responseText);
-      console.log(`[Gemini CLI] 完成，耗时 ${duration}ms，输出 ${responseText.length} 字节${capturedSessionId ? '，session:' + capturedSessionId.slice(0, 8) : ''}`);
-      resolve({
-        stdout: responseText, stderr: stderr.trim(),
-        exitCode: code || 0, error: code ? `Exit code ${code}` : null, duration,
-        metadata: capturedSessionId ? { sessionId: capturedSessionId } : undefined
-      });
-    });
-
-    child.on('error', (err) => {
-      clearTimeout(timer);
-      resolve({
-        stdout, stderr: err.message, exitCode: -1,
-        error: err.message, duration: Date.now() - startTime
-      });
-    });
-  });
-}
-
-// ========== CLI 回退执行（原有逻辑） ==========
+// ========== Claude CLI 执行 ==========
 const CLAUDE_PATH = '/opt/homebrew/bin/claude';
-const CODEX_PATH = '/opt/homebrew/bin/codex';
-const GEMINI_PATH = '/opt/homebrew/bin/gemini';
 const CC_LOG = '/tmp/cc-live.log';
 
 function buildCliEnv(extra = {}) {
@@ -1008,8 +558,8 @@ function executeClaudeCLI(prompt, timeout, sessionId, model) {
 }
 
 // ========== 完成通知（最终结果推回 bot 侧 callback channel） ==========
-const CLI_TASK_TYPES = new Set(['claude-cli', 'codex-cli', 'gemini-cli']);
-const CLI_LABELS = { 'claude-cli': 'CC', 'codex-cli': 'Codex', 'gemini-cli': 'Gemini' };
+const CLI_TASK_TYPES = new Set(['claude-cli']);
+const CLI_LABELS = { 'claude-cli': 'CC' };
 
 function describeTaskMode(task) {
   const mode = task.dispatchMode || 'unspecified';
@@ -1121,18 +671,14 @@ async function executeTask(task) {
     } else if (task.type === 'claude-cli') {
       // 短 ID 前缀解析（/cc-recent 显示 8 位，用户照抄后需要还原完整 UUID）
       if (task.sessionId) task.sessionId = resolveSessionPrefix(task.sessionId);
-      console.log(`[${runningTasks.size}/${CONFIG.maxConcurrent}] [Claude ${sdkQuery ? 'SDK' : 'CLI'}] ${taskId} ${describeTaskMode(task)} - ${task.prompt?.slice(0, 50)}...`);
+      console.log(`[${runningTasks.size}/${CONFIG.maxConcurrent}] [Claude CLI] ${taskId} ${describeTaskMode(task)} - ${task.prompt?.slice(0, 50)}...`);
       // ack 已由 cc-bridge registerCommand 处理，worker 不再重复推
-      // CC 模型 fallback：Opus → Sonnet → 不指定（用 CC 默认）
+      // CC 模型 fallback：Opus → Sonnet
       const CC_MODELS = ['claude-opus-4-6', 'claude-sonnet-4-6'];
       for (let i = 0; i < CC_MODELS.length; i++) {
         const model = CC_MODELS[i];
         try {
-          if (sdkQuery) {
-            result = await executeClaudeSDK(task.prompt, task.timeout, task.sessionId, task.callbackChannel, model);
-          } else {
-            result = await executeClaudeCLI(task.prompt, task.timeout, task.sessionId, model);
-          }
+          result = await executeClaudeCLI(task.prompt, task.timeout, task.sessionId, model);
           // 成功或正常退出（exitCode 非 0 也算完成，不重试）
           break;
         } catch (err) {
@@ -1141,19 +687,9 @@ async function executeTask(task) {
           if (isLast) throw err;
         }
       }
-    } else if (task.type === 'codex-cli') {
-      console.log(`[${runningTasks.size}/${CONFIG.maxConcurrent}] [Codex CLI] ${taskId} ${describeTaskMode(task)}${task.sessionId ? ' [session:' + task.sessionId.slice(0, 8) + ']' : ''}${task.model ? ' [' + task.model + ']' : ''} - ${task.prompt?.slice(0, 50)}...`);
-      result = await executeCodexCLI(task.prompt, task.timeout, task.sessionId, task.model);
-    } else if (task.type === 'gemini-cli') {
-      console.log(`[${runningTasks.size}/${CONFIG.maxConcurrent}] [Gemini CLI] ${taskId} ${describeTaskMode(task)}${task.resumeLatest ? ' [resume:latest]' : ''}${task.model ? ' [' + task.model + ']' : ''} - ${task.prompt?.slice(0, 50)}...`);
-      result = await executeGeminiCLI(task.prompt, task.timeout, task.resumeLatest, task.model);
     } else {
       console.log(`[${runningTasks.size}/${CONFIG.maxConcurrent}] [命令] ${taskId}... - ${task.command}`);
       result = await executeCommand(task.command, task.timeout);
-    }
-
-    if ((task.type === 'codex-cli' || task.type === 'gemini-cli') && result.metadata?.sessionId) {
-      rememberMappedSession(task.sessionId, result.metadata.sessionId, task.callbackChannel);
     }
 
     // 上报结果
