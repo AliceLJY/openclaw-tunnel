@@ -4,11 +4,21 @@ Run Claude Code from your chat app, even when OpenClaw lives in Docker and your 
 
 ---
 
-## Why not acpx?
+## acpx vs tunnel
 
-[acpx](https://docs.openclaw.io/plugins/acpx) is the standard OpenClaw plugin for calling Claude Code. It works by spawning the CLI as a child process — which requires the CLI and OpenClaw to be on the same machine with access to the same filesystem.
+[acpx](https://github.com/openclaw/acpx) is the official OpenClaw CLI client built on the [Agent Client Protocol](https://agentclientprotocol.com/) (ACP) — a standard co-developed by Zed and JetBrains for connecting editors and orchestrators to AI coding agents. acpx works by spawning the CLI as a local child process over stdio. If OpenClaw and Claude Code are on the same machine, acpx is the right choice: fast, zero-overhead, protocol-native.
 
-When OpenClaw runs in Docker, that assumption breaks. A container cannot stdio-spawn a process on the host. openclaw-tunnel solves this with a lightweight task queue: the plugin (inside Docker) enqueues tasks over HTTP, and a runner on the host picks them up and executes Claude Code for real.
+**The problem:** when OpenClaw runs in Docker, acpx cannot reach a CLI on the host. ACP is a stdio protocol — there is no network transport. The `--agent` flag only accepts local executable paths, not URLs. Remote ACP is still listed as "work in progress" in the protocol spec.
+
+**What tunnel does:** instead of waiting for remote ACP support, tunnel bridges the gap with a task queue. The plugin (inside Docker) enqueues tasks over HTTP to a `task-api` service. A runner on the host long-polls for tasks, spawns Claude Code, and posts results back to your chat channel via callback. No stdio required across the container boundary.
+
+| | acpx | tunnel |
+|---|---|---|
+| Protocol | ACP (JSON-RPC over stdio) | HTTP task queue + callback |
+| Requires same machine | Yes | No — Docker + host |
+| Session model | By git directory | By chat channel |
+| Token cost | Zero (protocol layer) | Zero (protocol layer) |
+| Best for | OpenClaw on host | OpenClaw in Docker |
 
 ---
 
