@@ -20,6 +20,8 @@ fi
 WORKER_URL="${WORKER_URL:-http://localhost:3456}"
 WORKER_TOKEN="${WORKER_TOKEN:-}"
 CLAUDE_PATH="${CLAUDE_PATH:-claude}"
+CODEX_PATH="${CODEX_PATH:-codex}"
+GEMINI_PATH="${GEMINI_PATH:-gemini}"
 CC_TIMEOUT="${CC_TIMEOUT:-1200000}"
 NODE_PATH="$(which node 2>/dev/null || echo "/usr/local/bin/node")"
 
@@ -60,6 +62,10 @@ cat > "$PLIST_PATH" <<PLIST
     <string>${WORKER_TOKEN}</string>
     <key>CLAUDE_PATH</key>
     <string>${CLAUDE_PATH}</string>
+    <key>CODEX_PATH</key>
+    <string>${CODEX_PATH}</string>
+    <key>GEMINI_PATH</key>
+    <string>${GEMINI_PATH}</string>
     <key>CC_TIMEOUT</key>
     <string>${CC_TIMEOUT}</string>
   </dict>

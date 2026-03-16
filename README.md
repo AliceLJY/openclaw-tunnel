@@ -1,6 +1,6 @@
 # openclaw-tunnel
 
-Run Claude Code from your chat app, even when OpenClaw lives in Docker and your CLI lives on the host.
+Run Claude Code, Codex, and Gemini from your chat app, even when OpenClaw lives in Docker and your CLIs live on the host.
 
 ---
 
@@ -38,19 +38,23 @@ Run Claude Code from your chat app, even when OpenClaw lives in Docker and your 
 │              ┌────────┴───────┐ │
 │              │  runner        │ │
 │              │  → Claude Code │ │
+│              │  → Codex       │ │
+│              │  → Gemini      │ │
 │              └────────────────┘ │
 └─────────────────────────────────┘
 ```
 
-The plugin submits tasks to `task-api` (running in Docker alongside OpenClaw). The runner on the host long-polls for pending tasks, executes Claude Code CLI, and posts results back directly to your chat channel via bot callback.
+The plugin submits tasks to `task-api` (running in Docker alongside OpenClaw). The runner on the host long-polls for pending tasks, executes the requested CLI (Claude Code, Codex, or Gemini), and posts results back directly to your chat channel via bot callback.
 
 ---
 
 ## Features
 
-**Session continuity** — each chat channel maintains its own Claude Code session. `/cc` automatically continues the previous conversation. `/cc-new`, `/cc-resume`, and `/cc-recent` give you full session control.
+**Three CLIs** — `/cc` for Claude Code, `/codex` for Codex, `/gemini` for Gemini. Each with full session management.
 
-**Zero-token relay** — the tunnel is a protocol layer only. No LLM calls happen in the plugin or the runner. The only tokens consumed are Claude Code's own.
+**Session continuity** — each chat channel maintains its own session per CLI. `/cc` automatically continues the previous conversation. `/cc-new`, `/cc-resume`, and `/cc-recent` give you full session control. Same for `/codex-*` and `/gemini-*`.
+
+**Zero-token relay** — the tunnel is a protocol layer only. No LLM calls happen in the plugin or the runner. The only tokens consumed are the CLIs' own.
 
 **Platform agnostic** — works with Discord, Telegram, or any platform that OpenClaw supports. The callback mechanism uses a standard bot token.
 
@@ -83,23 +87,24 @@ After setup, copy the `plugin/` directory into your OpenClaw plugins folder (or 
 
 **`task-api/`** — Express HTTP server that runs in Docker. Accepts tasks from the plugin, stores them in SQLite, and serves them to the runner over long-polling. Posts results back to your chat via bot callback.
 
-**`runner/`** — Node.js worker that runs on the host. Long-polls `task-api` for pending tasks, spawns Claude Code CLI as a child process, and reports results back. Supports up to 5 concurrent tasks.
+**`runner/`** — Node.js worker that runs on the host. Long-polls `task-api` for pending tasks, spawns Claude Code / Codex / Gemini CLI as child processes, and reports results back. Supports up to 5 concurrent tasks.
 
-**`plugin/`** — OpenClaw plugin (TypeScript). Registers the `/cc` command family, manages per-channel session bindings in a local SQLite store, and submits tasks to `task-api`.
+**`plugin/`** — OpenClaw plugin (TypeScript). Registers `/cc`, `/codex`, `/gemini` command families, manages per-channel session bindings in a local SQLite store, and submits tasks to `task-api`.
 
 ---
 
 ## Session Commands
 
-| Command | Description |
-|---|---|
-| `/cc <prompt>` | Submit a task, continuing the current session for this channel |
-| `/cc-new` | Start a fresh session |
-| `/cc-new <prompt>` | Start a fresh session and submit a task immediately |
-| `/cc-recent` | List recent sessions for this channel |
-| `/cc-resume <id> <prompt>` | Resume a specific session by ID |
-| `/cc-now` | Show the active session ID for this channel |
-| `/cli-state` | Check runner connectivity and task-api health |
+Each CLI has the same command pattern:
+
+| Claude Code | Codex | Gemini | Description |
+|---|---|---|---|
+| `/cc <prompt>` | `/codex <prompt>` | `/gemini <prompt>` | Submit task, continue session |
+| `/cc-new` | `/codex-new` | `/gemini-new` | Start fresh session |
+| `/cc-recent` | — | — | List recent sessions |
+| `/cc-resume <id>` | `/codex-resume <id>` | `/gemini-resume <id>` | Resume specific session |
+| `/cc-now` | `/codex-now` | `/gemini-now` | Show active session ID |
+| `/cli-state` | `/cli-state` | `/cli-state` | Check connectivity |
 
 ---
 

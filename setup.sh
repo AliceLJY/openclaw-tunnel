@@ -49,6 +49,32 @@ else
   echo "  ✅ Claude Code CLI (${CLAUDE_PATH})"
 fi
 
+# Codex CLI
+DEFAULT_CODEX="codex"
+read -rp "  Codex CLI path [${DEFAULT_CODEX}] (skip to disable): " CODEX_PATH
+CODEX_PATH="${CODEX_PATH:-$DEFAULT_CODEX}"
+if [[ "$CODEX_PATH" != "skip" ]] && command -v "$CODEX_PATH" &>/dev/null; then
+  echo "  ✅ Codex CLI (${CODEX_PATH})"
+elif [[ "$CODEX_PATH" == "skip" ]]; then
+  CODEX_PATH=""
+  echo "  ⏭️  Codex disabled"
+else
+  echo "  ⚠️  '${CODEX_PATH}' not found — Codex will fail until installed"
+fi
+
+# Gemini CLI
+DEFAULT_GEMINI="gemini"
+read -rp "  Gemini CLI path [${DEFAULT_GEMINI}] (skip to disable): " GEMINI_PATH
+GEMINI_PATH="${GEMINI_PATH:-$DEFAULT_GEMINI}"
+if [[ "$GEMINI_PATH" != "skip" ]] && command -v "$GEMINI_PATH" &>/dev/null; then
+  echo "  ✅ Gemini CLI (${GEMINI_PATH})"
+elif [[ "$GEMINI_PATH" == "skip" ]]; then
+  GEMINI_PATH=""
+  echo "  ⏭️  Gemini disabled"
+else
+  echo "  ⚠️  '${GEMINI_PATH}' not found — Gemini will fail until installed"
+fi
+
 echo ""
 
 # ── Configuration ───────────────────────────────────
@@ -106,6 +132,8 @@ CALLBACK_API_BASE_URL=https://discord.com/api/v10
 # === runner (runs on host) ===
 WORKER_URL=http://localhost:${PORT}
 CLAUDE_PATH=${CLAUDE_PATH}
+CODEX_PATH=${CODEX_PATH}
+GEMINI_PATH=${GEMINI_PATH}
 CC_TIMEOUT=1200000
 ENV
 

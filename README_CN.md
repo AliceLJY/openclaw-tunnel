@@ -1,6 +1,6 @@
 # openclaw-tunnel
 
-让 Docker 里的 OpenClaw 调得动宿主机上的 Claude Code CLI。
+让 Docker 里的 OpenClaw 调得动宿主机上的 Claude Code / Codex / Gemini CLI。
 
 ---
 
