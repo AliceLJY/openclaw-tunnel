@@ -235,6 +235,12 @@ openclaw-tunnel 用的是长轮询：runner 发起一个 `GET /worker/poll?wait=
 
 ---
 
+## 作者
+
+[AliceLJY](https://github.com/AliceLJY) — 不是程序员，用 Claude Code 搭 AI agent 基础设施的野路子玩家。公众号「我的AI小木屋」记录折腾过程。
+
+这个项目来自真实的痛：五个 OpenClaw bot 跑在 Docker 里，Claude Code / Codex / Gemini 在宿主机上，中间隔着容器边界。原版多 runner 方案在 [openclaw-worker](https://github.com/AliceLJY/openclaw-worker) 和 [openclaw-cli-bridge](https://github.com/AliceLJY/openclaw-cli-bridge)。
+
 ## 许可证
 
 MIT
