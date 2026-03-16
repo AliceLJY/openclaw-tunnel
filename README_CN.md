@@ -4,13 +4,21 @@
 
 ---
 
-## 为什么不用 acpx 插件？
+## acpx vs tunnel
 
-acpx 是 OpenClaw 官方的 Claude Code 集成方案，好用，但有一个硬限制：它直接在进程内调 CC，意味着 CC 必须和 OpenClaw 跑在同一个环境里。
+[acpx](https://github.com/openclaw/acpx) 是 OpenClaw 官方的 CLI 客户端，基于 [Agent Client Protocol](https://agentclientprotocol.com/)（ACP）— Zed 和 JetBrains 联合推动的开放协议。acpx 通过 stdio 直接 spawn 本地 CLI 进程，快、零开销、协议原生。如果 OpenClaw 和 Claude Code 在同一台机器上，用 acpx 就对了。
 
-如果你的 OpenClaw 跑在 Docker 容器里，CC 装在宿主机上——两边之间有一道容器边界，acpx 过不去。
+**问题在哪：** OpenClaw 跑在 Docker 里的时候，acpx 够不到宿主机上的 CLI。ACP 是 stdio 协议，没有网络传输层。`--agent` 参数只接受本地可执行文件路径，不接受 URL。远程 ACP 在协议规范里还标着"work in progress"。
 
-openclaw-tunnel 的做法是绕开这道边界：在中间架一个 task-api，插件把任务推进去，宿主机上的 runner 从里面捞出来执行，结果直接推回 Discord 频道。整个过程不需要 acpx，也不占 agent token。
+**tunnel 怎么解决：** 不等远程 ACP 落地，直接用 HTTP 任务队列绕过去。插件（Docker 内）把任务推到 task-api，宿主机上的 runner 长轮询拉取任务，spawn Claude Code，结果通过 callback 直推聊天频道。不需要跨容器的 stdio。
+
+| | acpx | tunnel |
+|---|---|---|
+| 协议 | ACP（stdio JSON-RPC） | HTTP 任务队列 + callback |
+| 需要同一台机器 | 是 | 不需要 — Docker + 宿主机 |
+| 会话模型 | 按 git 目录绑定 | 按聊天频道绑定 |
+| token 消耗 | 零（协议层） | 零（协议层） |
+| 适合场景 | OpenClaw 直接跑在宿主机 | OpenClaw 在 Docker 里 |
 
 ---
 
