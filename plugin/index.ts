@@ -1,29 +1,29 @@
 /**
  * CLI Bridge — OpenClaw Plugin
  *
- * 架构（学自 HappyClaw）：
- * - /cc 命令通过 registerCommand 注册，零 agent token，零杂音
- * - CC 结果由 worker 直推 callback channel（默认兼容 Discord Bot API），不经过 agent 润色
- * - cc_call 等工具保留给其他频道 agent 使用
+ * Architecture (inspired by HappyClaw):
+ * - /cc commands are registered via registerCommand — zero agent tokens, zero noise
+ * - CC results are pushed directly to the callback channel by the worker (Discord Bot API compatible), bypassing agent formatting
+ * - cc_call and similar tools are reserved for agents in other channels
  *
- * 用法（任意频道）：
- *   /cc <问题>        → 提交 CC 任务（自动续接上一轮）
- *   /cc-recent        → 查看最近会话列表
- *   /cc-now           → 查看当前会话
- *   /cc-new           → 重置会话
- *   /cc-new <问题>    → 重置后立即提问
- *   /cc-resume <id> <问题> → 手动指定 session 续接
+ * Usage (any channel):
+ *   /cc <prompt>        → Submit a CC task (auto-resumes previous session)
+ *   /cc-recent          → List recent sessions
+ *   /cc-now             → Show current session
+ *   /cc-new             → Reset session
+ *   /cc-new <prompt>    → Reset and immediately submit a prompt
+ *   /cc-resume <id> <prompt> → Manually resume a specific session
  *
- * 框架限制：matchPluginCommand 用空格分割命令名和参数，
- * 所以 /cc最近（连写）匹配不到 /cc，会穿透给 agent。
- * 解决方案：子命令用独立 ASCII 命名（cc-recent 等），学 HappyClaw 模式。
+ * Framework constraint: matchPluginCommand splits on whitespace between command name and args,
+ * so /cc最近 (no space) won't match /cc and falls through to the agent.
+ * Solution: subcommands use standalone ASCII names (cc-recent, etc.), following the HappyClaw pattern.
  */
 
 import fs from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
-// ---- 运行时配置（由 register() 从 pluginConfig 注入） ----
+// ---- Runtime config (injected by register() from pluginConfig) ----
 let API_URL = "";
 let API_TOKEN = "";
 let CC_CHANNEL = "";
@@ -45,13 +45,13 @@ type SessionBindingRow = {
   sessionId: string;
 };
 
-// ---- 工具结果 helper ----
+// ---- Tool result helper ----
 function text(data: unknown) {
   const t = typeof data === "string" ? data : JSON.stringify(data, null, 2);
   return { content: [{ type: "text" as const, text: t }] };
 }
 
-// ---- API 请求 helper ----
+// ---- API request helper ----
 async function api(method: string, path: string, body?: unknown) {
   const opts: RequestInit = {
     method,
@@ -84,7 +84,7 @@ function buildTaskBody(
   return body;
 }
 
-// ---- 会话跟踪（按频道隔离，每个频道独立 session） ----
+// ---- Session tracking (isolated per channel, each channel has its own session) ----
 const channelSessions = new Map<string, string>();
 const cliSessions = new Map<string, string>(); // "endpoint:channelKey" → sessionId
 
@@ -219,27 +219,27 @@ function collectSessionBindings(channelKey: string) {
 function formatStateText(channelKey: string, includeAll: boolean) {
   const state = collectSessionBindings(channelKey);
   const lines = [
-    "CLI Bridge 状态",
+    "CLI Bridge Status",
     "",
-    `当前频道: \`${channelKey}\``,
+    `Current channel: \`${channelKey}\``,
     `sessionStore: \`${state.sessionStorePath}\``,
-    `直连优先: 是`,
-    `委托模式: 仅在需要规划/编排时使用`,
+    `Direct mode: yes`,
+    `Delegated mode: only used when planning/orchestration is needed`,
     "",
-    "当前绑定:",
-    `- CC: ${state.current.cc ? `\`${state.current.cc}\`` : "无"}`,
-    `- Codex: ${state.current.codex ? `\`${state.current.codex}\`` : "无"}`,
-    `- Gemini: ${state.current.gemini ? `\`${state.current.gemini}\`` : "无"}`,
+    "Current bindings:",
+    `- CC: ${state.current.cc ? `\`${state.current.cc}\`` : "none"}`,
+    `- Codex: ${state.current.codex ? `\`${state.current.codex}\`` : "none"}`,
+    `- Gemini: ${state.current.gemini ? `\`${state.current.gemini}\`` : "none"}`,
     "",
-    `总绑定数: CC ${state.counts.cc} / CLI ${state.counts.cli} / 全部 ${state.counts.total}`,
+    `Total bindings: CC ${state.counts.cc} / CLI ${state.counts.cli} / All ${state.counts.total}`,
   ];
 
   if (includeAll) {
     const recent = state.bindings.slice(0, 20);
     lines.push("");
-    lines.push(`最近绑定（最多 20 条，当前共 ${state.bindings.length} 条）:`);
+    lines.push(`Recent bindings (up to 20, ${state.bindings.length} total):`);
     if (recent.length === 0) {
-      lines.push("- 无");
+      lines.push("- none");
     } else {
       for (const row of recent) {
         lines.push(`- ${row.scope} | ${row.key} | \`${row.sessionId}\``);
@@ -257,94 +257,94 @@ async function handleStateCommand(ctx: any): Promise<{ text: string; isError?: b
   };
 }
 
-// ---- /cc 命令 handler ----
+// ---- /cc command handler ----
 async function handleCcCommand(ctx: any): Promise<{ text: string; isError?: boolean }> {
   const log = (globalThis as any).__cliBridgeLog ?? console;
   let args = (ctx.args || "").trim();
 
-  // 频道 key：按频道隔离 session
+  // Channel key: sessions are isolated per channel
   const channelKey = getCurrentChannelKey(ctx);
   const lastSessionId = channelSessions.get(channelKey) || null;
 
   log.info(`[cli-bridge] handler called | args="${args}" | channel=${channelKey.slice(0, 8)} | session=${lastSessionId?.slice(0, 8) || 'none'}`);
 
-  // 空命令 → 帮助
+  // Empty command → show help
   if (!args) {
-    const session = lastSessionId ? `当前会话: \`${lastSessionId}\`` : "当前无活跃会话";
+    const session = lastSessionId ? `Current session: \`${lastSessionId}\`` : "No active session";
     return {
-      text: `📋 CLI Bridge 命令：
-/cc <问题> — 提交任务（同频道自动续接，不用手动带 ID）
-/cc-new — 开始全新会话
-/cc-new <问题> — 开新会话并立即提问
-/cc-recent — 查看最近会话列表
-/cc-now — 查看当前会话 ID
-/cc-resume <id> <问题> — 切到指定历史会话继续聊
+      text: `📋 CLI Bridge commands:
+/cc <prompt> — Submit a task (auto-resumes in the same channel, no need to pass an ID)
+/cc-new — Start a fresh session
+/cc-new <prompt> — Start a fresh session and submit a prompt immediately
+/cc-recent — List recent sessions
+/cc-now — Show current session ID
+/cc-resume <id> <prompt> — Switch to a specific session and continue
 
-💡 同一频道连着发 /cc 就是同一轮对话
+💡 Consecutive /cc calls in the same channel share the same session
 ${session}`
     };
   }
 
-  // /cc最近 → 查询最近会话
+  // /cc recent → list recent sessions
   if (/^(最近|recent)/i.test(args)) {
-    log.info("[cli-bridge] /cc最近: 查询会话列表");
+    log.info("[cli-bridge] /cc-recent: listing sessions");
     try {
       const res = await api("GET", "/claude/recent?limit=8");
-      if (!res.ok) return { text: "❌ 查询失败", isError: true };
+      if (!res.ok) return { text: "❌ Query failed", isError: true };
       const data = await res.json() as { sessions: Array<{ sessionId: string; lastModified: string; sizeKB: number; topic: string }> };
-      if (!data.sessions?.length) return { text: "没有找到最近的 CC 会话。" };
+      if (!data.sessions?.length) return { text: "No recent CC sessions found." };
 
       const lines = data.sessions.map((s: any, i: number) => {
         const time = new Date(s.lastModified).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" });
         const topic = (s.topic || "(no topic)").replace(/\s+/g, " ").trim().slice(0, 50) + (s.topic?.length > 50 ? "…" : "");
         return `${i + 1}. ${topic}\n   \`${s.sessionId}\` | ${time} | ${s.sizeKB}KB`;
       });
-      const current = lastSessionId ? `\n当前: \`${lastSessionId}\`` : "\n当前无活跃会话";
-      return { text: "📋 最近 CC 会话\n\n" + lines.join("\n\n") + current };
+      const current = lastSessionId ? `\nCurrent: \`${lastSessionId}\`` : "\nNo active session";
+      return { text: "📋 Recent CC sessions\n\n" + lines.join("\n\n") + current };
     } catch (err: unknown) {
       return { text: `❌ ${err instanceof Error ? err.message : String(err)}`, isError: true };
     }
   }
 
-  // /cc当前 → 显示当前 session
+  // /cc now → show current session
   if (/^(当前|现在|session$)/i.test(args)) {
     return {
       text: lastSessionId
-        ? `当前会话: \`${lastSessionId}\``
-        : "当前无活跃会话。发 /cc <问题> 开始新会话。"
+        ? `Current session: \`${lastSessionId}\``
+        : "No active session. Send /cc <prompt> to start a new one."
     };
   }
 
-  // /cc新会话 [prompt] → 重置 + 可选立即提问
+  // /cc new [prompt] → reset session + optionally submit a prompt
   if (/^(新会话|new)/i.test(args)) {
     deleteSession(channelSessions, channelKey, log);
     const prompt = args.replace(/^(新会话|new)\s*/i, "").trim();
     if (!prompt) {
-      log.info("[cli-bridge] /cc新会话: 会话已重置");
-      return { text: "🔄 会话已重置，下次 /cc 将开始新会话。" };
+      log.info("[cli-bridge] /cc-new: session reset");
+      return { text: "🔄 Session reset. Next /cc will start a new session." };
     }
     args = prompt;
   }
 
-  // /cc接续 <sessionId> [prompt] → 手动指定 session
+  // /cc resume <sessionId> [prompt] → manually specify a session
   const resumeMatch = args.match(/^接续\s+([a-f0-9-]{8,})\s*(.*)/i);
   if (resumeMatch) {
     setSession(channelSessions, channelKey, resumeMatch[1], log);
     const prompt = resumeMatch[2].trim();
-    log.info(`[cli-bridge] /cc接续: session=${resumeMatch[1].slice(0, 8)}`);
+    log.info(`[cli-bridge] /cc-resume: session=${resumeMatch[1].slice(0, 8)}`);
     if (!prompt) {
-      return { text: `🔗 已切换到会话 \`${resumeMatch[1]}\`\n下次 /cc <问题> 将在此会话继续。` };
+      return { text: `🔗 Switched to session \`${resumeMatch[1]}\`\nNext /cc <prompt> will continue in this session.` };
     }
     args = prompt;
   }
 
-  // 默认：提交 CC 任务
+  // Default: submit a CC task
   const prompt = args;
   const currentSession = channelSessions.get(channelKey) || null;
 
-  // 回调频道：在哪问就在哪回
+  // Callback channel: respond in the same channel the request came from
   const callback = channelKey !== "default" ? channelKey : CC_CHANNEL;
-  log.info(`[cli-bridge] /cc 提交: "${prompt.slice(0, 50)}..."${currentSession ? ' [session:' + currentSession.slice(0, 8) + ']' : ' [新会话]'} → callback:${callback.slice(0, 8)}`);
+  log.info(`[cli-bridge] /cc submit: "${prompt.slice(0, 50)}..."${currentSession ? ' [session:' + currentSession.slice(0, 8) + ']' : ' [new session]'} → callback:${callback.slice(0, 8)}`);
 
   const body: Record<string, unknown> = {
     ...buildTaskBody(prompt, 1200000, callback, "direct-command", "cc"),
@@ -355,22 +355,22 @@ ${session}`
     const res = await api("POST", "/claude", body);
     if (!res.ok) {
       const errText = await res.text();
-      log.error(`[cli-bridge] 提交失败: ${res.status} ${errText}`);
-      return { text: `❌ 提交失败: ${res.status}`, isError: true };
+      log.error(`[cli-bridge] submit failed: ${res.status} ${errText}`);
+      return { text: `❌ Submit failed: ${res.status}`, isError: true };
     }
 
     const data = await res.json() as { taskId: string; sessionId: string };
     setSession(channelSessions, channelKey, data.sessionId, log);
-    log.info(`[cli-bridge] 提交成功: task=${data.taskId.slice(0, 8)}, session=${data.sessionId.slice(0, 8)}`);
+    log.info(`[cli-bridge] submitted: task=${data.taskId.slice(0, 8)}, session=${data.sessionId.slice(0, 8)}`);
     return { text: "" };
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
-    log.error(`[cli-bridge] 提交异常: ${msg}`);
-    return { text: `❌ 无法连接 task-api: ${msg}`, isError: true };
+    log.error(`[cli-bridge] submit error: ${msg}`);
+    return { text: `❌ Cannot connect to task-api: ${msg}`, isError: true };
   }
 }
 
-// ---- /codex 和 /gemini 通用 handler（支持 session 续接） ----
+// ---- Generic handler for /codex and /gemini (with session resumption) ----
 
 async function handleGenericCLI(
   ctx: any,
@@ -387,43 +387,43 @@ async function handleGenericCLI(
   if (/^(当前|现在|session)$/i.test(prompt)) {
     return {
       text: currentSession
-        ? `${label} 当前会话: \`${currentSession}\``
-        : `${label} 当前无活跃会话。发 /${label.toLowerCase()} <问题> 开始新会话。`,
+        ? `${label} current session: \`${currentSession}\``
+        : `${label} has no active session. Send /${label.toLowerCase()} <prompt> to start a new one.`,
     };
   }
 
-  // /codex 新会话 / /gemini new → 重置会话
+  // /codex new / /gemini new → reset session
   if (/^(新会话|new)/i.test(prompt)) {
     deleteSession(cliSessions, sessionKey, log);
     currentSession = null;
     prompt = prompt.replace(/^(新会话|new)\s*/i, "").trim();
     if (!prompt) {
-      return { text: `🔄 ${label} 会话已重置，下次提问开始新会话。` };
+      return { text: `🔄 ${label} session reset. Next prompt will start a new session.` };
     }
   }
 
-  // /codex 接续 <sessionId> [prompt] → 手动指定 session
+  // /codex resume <sessionId> [prompt] → manually specify a session
   const resumeMatch = prompt.match(/^接续\s+([a-f0-9-]{8,})\s*(.*)/i);
   if (resumeMatch) {
     setSession(cliSessions, sessionKey, resumeMatch[1], log);
     currentSession = resumeMatch[1];
-    log.info(`[cli-bridge] /${label.toLowerCase()} 接续: session=${resumeMatch[1].slice(0, 8)}`);
+    log.info(`[cli-bridge] /${label.toLowerCase()} resume: session=${resumeMatch[1].slice(0, 8)}`);
     prompt = resumeMatch[2].trim();
     if (!prompt) {
-      return { text: `🔗 已切换到 ${label} 会话 \`${resumeMatch[1]}\`\n下次 /${label.toLowerCase()} <问题> 将在此会话继续。` };
+      return { text: `🔗 Switched to ${label} session \`${resumeMatch[1]}\`\nNext /${label.toLowerCase()} <prompt> will continue in this session.` };
     }
   }
 
   if (!prompt) {
     return {
       text: currentSession
-        ? `${label} 当前会话: \`${currentSession}\`\n发 /${label.toLowerCase()} <问题> 继续对话\n发 /${label.toLowerCase()} 新会话 重置\n发 /${label.toLowerCase()} 接续 <sessionId> 手动恢复`
-        : `用法: /${label.toLowerCase()} <问题>`
+        ? `${label} current session: \`${currentSession}\`\nSend /${label.toLowerCase()} <prompt> to continue\nSend /${label.toLowerCase()} new to reset\nSend /${label.toLowerCase()} resume <sessionId> to restore manually`
+        : `Usage: /${label.toLowerCase()} <prompt>`
     };
   }
 
   const callback = channelKey !== "default" ? channelKey : CC_CHANNEL;
-  log.info(`[cli-bridge] /${label.toLowerCase()} 提交: "${prompt.slice(0, 50)}..."${currentSession ? ' [session:' + currentSession.slice(0, 8) + ']' : ' [新会话]'} → callback:${callback.slice(0, 8)}`);
+  log.info(`[cli-bridge] /${label.toLowerCase()} submit: "${prompt.slice(0, 50)}..."${currentSession ? ' [session:' + currentSession.slice(0, 8) + ']' : ' [new session]'} → callback:${callback.slice(0, 8)}`);
 
   const body: Record<string, unknown> = {
     ...buildTaskBody(prompt, 300000, callback, "direct-command", label.toLowerCase()),
@@ -437,26 +437,26 @@ async function handleGenericCLI(
     const res = await api("POST", endpoint, body);
     if (!res.ok) {
       const errText = await res.text();
-      log.error(`[cli-bridge] ${label} 提交失败: ${res.status} ${errText}`);
-      return { text: `❌ ${label} 提交失败: ${res.status}`, isError: true };
+      log.error(`[cli-bridge] ${label} submit failed: ${res.status} ${errText}`);
+      return { text: `❌ ${label} submit failed: ${res.status}`, isError: true };
     }
 
     const data = await res.json() as { taskId: string; sessionId?: string };
     if (data.sessionId) {
       setSession(cliSessions, sessionKey, data.sessionId, log);
-      log.info(`[cli-bridge] ${label} 会话已绑定: ${data.sessionId.slice(0, 8)}`);
+      log.info(`[cli-bridge] ${label} session bound: ${data.sessionId.slice(0, 8)}`);
     }
-    log.info(`[cli-bridge] ${label} 提交成功: task=${data.taskId.slice(0, 8)}`);
+    log.info(`[cli-bridge] ${label} submitted: task=${data.taskId.slice(0, 8)}`);
 
     return { text: "" };
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
-    log.error(`[cli-bridge] ${label} 提交异常: ${msg}`);
-    return { text: `❌ 无法连接 task-api: ${msg}`, isError: true };
+    log.error(`[cli-bridge] ${label} submit error: ${msg}`);
+    return { text: `❌ Cannot connect to task-api: ${msg}`, isError: true };
   }
 }
 
-// ---- cc_call 工具（其他频道 agent 用） ----
+// ---- cc_call tool (for agents in other channels) ----
 const ccCallTool = {
   name: "cc_call",
   label: "Call Claude Code",
@@ -466,7 +466,7 @@ const ccCallTool = {
     "IMPORTANT: Always pass 'channel' so the result is delivered to the CURRENT channel. " +
     "For NEW tasks: provide 'prompt' and 'channel'. " +
     "For FOLLOW-UP in an existing session: also provide 'sessionId'. " +
-    "After calling this tool, tell the user '已提交，等 CC 回调' and STOP.",
+    "After calling this tool, tell the user 'Submitted, waiting for CC callback' and STOP.",
   parameters: {
     type: "object" as const,
     properties: {
@@ -513,7 +513,7 @@ const ccCallTool = {
   },
 };
 
-// ---- codex_call 工具（agent 调 Codex CLI） ----
+// ---- codex_call tool (agent delegates to Codex CLI) ----
 const codexCallTool = {
   name: "codex_call",
   label: "Call Codex CLI",
@@ -521,7 +521,7 @@ const codexCallTool = {
     "Submit a task to OpenAI Codex CLI via task-api. Returns immediately. " +
     "Codex's output will be delivered DIRECTLY to the callback channel via callback (not through you). " +
     "IMPORTANT: Always pass 'channel' so the result is delivered to the CURRENT channel. " +
-    "After calling this tool, tell the user '已提交，等 Codex 回调' and STOP.",
+    "After calling this tool, tell the user 'Submitted, waiting for Codex callback' and STOP.",
   parameters: {
     type: "object" as const,
     properties: {
@@ -568,7 +568,7 @@ const codexCallTool = {
   },
 };
 
-// ---- gemini_call 工具（agent 调 Gemini CLI） ----
+// ---- gemini_call tool (agent delegates to Gemini CLI) ----
 const geminiCallTool = {
   name: "gemini_call",
   label: "Call Gemini CLI",
@@ -576,7 +576,7 @@ const geminiCallTool = {
     "Submit a task to Google Gemini CLI via task-api. Returns immediately. " +
     "Gemini's output will be delivered DIRECTLY to the callback channel via callback (not through you). " +
     "IMPORTANT: Always pass 'channel' so the result is delivered to the CURRENT channel. " +
-    "After calling this tool, tell the user '已提交，等 Gemini 回调' and STOP.",
+    "After calling this tool, tell the user 'Submitted, waiting for Gemini callback' and STOP.",
   parameters: {
     type: "object" as const,
     properties: {
@@ -623,12 +623,12 @@ const geminiCallTool = {
   },
 };
 
-// ---- Plugin 注册 ----
+// ---- Plugin registration ----
 export function register(pluginApi: any) {
   const log = pluginApi.log ?? console;
   (globalThis as any).__cliBridgeLog = log;
 
-  // 从 pluginConfig 读取配置（openclaw.json → plugins.entries.cli-bridge）
+  // Read config from pluginConfig (openclaw.json → plugins.entries.cli-bridge)
   const cfg = pluginApi.pluginConfig ?? {};
   API_URL = cfg.apiUrl || "http://host.docker.internal:3456";
   API_TOKEN = cfg.apiToken || "";
@@ -640,22 +640,22 @@ export function register(pluginApi: any) {
   if (!API_TOKEN) log.warn("[cli-bridge] ⚠ apiToken not configured — API calls will fail");
   if (!CC_CHANNEL) log.warn("[cli-bridge] ⚠ callbackChannel not configured — results won't be delivered");
 
-  // 核心：registerCommand — 零 token 直达，不经过 agent
-  // /cc <问题> 主命令
+  // Core: registerCommand — zero tokens, bypasses agent entirely
+  // /cc <prompt> main command
   pluginApi.registerCommand({
     name: "cc",
-    description: "远程控制 Claude Code（零 token，直达 task-api）",
+    description: "Remote-control Claude Code (zero tokens, direct to task-api)",
     acceptsArgs: true,
     requireAuth: true,
     handler: handleCcCommand,
   });
 
-  // 子命令：独立 ASCII 命名（框架要求命令名只能是字母数字连字符下划线）
+  // Subcommands: standalone ASCII names (framework requires alphanumeric/hyphen/underscore names)
   const subcommands = [
-    { name: "cc-recent", inject: "最近", desc: "查看最近 CC 会话" },
-    { name: "cc-now", inject: "当前", desc: "查看当前 CC 会话" },
-    { name: "cc-new", inject: "新会话", desc: "重置 CC 会话（可附带问题）" },
-    { name: "cc-resume", inject: "接续", desc: "手动续接指定 CC 会话" },
+    { name: "cc-recent", inject: "最近", desc: "List recent CC sessions" },
+    { name: "cc-now", inject: "当前", desc: "Show current CC session" },
+    { name: "cc-new", inject: "新会话", desc: "Reset CC session (optionally with a prompt)" },
+    { name: "cc-resume", inject: "接续", desc: "Manually resume a specific CC session" },
   ];
   for (const sub of subcommands) {
     pluginApi.registerCommand({
@@ -667,18 +667,18 @@ export function register(pluginApi: any) {
     });
   }
 
-  // /codex 和 /gemini 命令（支持 session 续接）
+  // /codex and /gemini commands (with session resumption)
   pluginApi.registerCommand({
     name: "codex",
-    description: "调用 OpenAI Codex CLI（直连模式，支持上下文续接，发 /codex 新会话 重置）",
+    description: "Call OpenAI Codex CLI (direct mode, supports session resumption; /codex new to reset)",
     acceptsArgs: true,
     requireAuth: true,
     handler: (ctx: any) => handleGenericCLI(ctx, "/codex", "Codex"),
   });
   for (const sub of [
-    { name: "codex-now", inject: "当前", desc: "查看当前 Codex 会话" },
-    { name: "codex-new", inject: "新会话", desc: "重置 Codex 会话（可附带问题）" },
-    { name: "codex-resume", inject: "接续", desc: "手动续接指定 Codex 会话" },
+    { name: "codex-now", inject: "当前", desc: "Show current Codex session" },
+    { name: "codex-new", inject: "新会话", desc: "Reset Codex session (optionally with a prompt)" },
+    { name: "codex-resume", inject: "接续", desc: "Manually resume a specific Codex session" },
   ]) {
     pluginApi.registerCommand({
       name: sub.name,
@@ -691,15 +691,15 @@ export function register(pluginApi: any) {
 
   pluginApi.registerCommand({
     name: "gemini",
-    description: "调用 Google Gemini CLI（直连模式；支持续接当前会话，底层使用 resume latest）",
+    description: "Call Google Gemini CLI (direct mode; supports session resumption via resume-latest under the hood)",
     acceptsArgs: true,
     requireAuth: true,
     handler: (ctx: any) => handleGenericCLI(ctx, "/gemini", "Gemini"),
   });
   for (const sub of [
-    { name: "gemini-now", inject: "当前", desc: "查看当前 Gemini 会话" },
-    { name: "gemini-new", inject: "新会话", desc: "重置 Gemini 会话（可附带问题）" },
-    { name: "gemini-resume", inject: "接续", desc: "手动续接指定 Gemini 会话" },
+    { name: "gemini-now", inject: "当前", desc: "Show current Gemini session" },
+    { name: "gemini-new", inject: "新会话", desc: "Reset Gemini session (optionally with a prompt)" },
+    { name: "gemini-resume", inject: "接续", desc: "Manually resume a specific Gemini session" },
   ]) {
     pluginApi.registerCommand({
       name: sub.name,
@@ -712,7 +712,7 @@ export function register(pluginApi: any) {
 
   pluginApi.registerCommand({
     name: "cli-state",
-    description: "查看 CLI Bridge 当前频道绑定和持久化状态（加 all 查看全局摘要）",
+    description: "View CLI Bridge channel bindings and persisted state (append 'all' for global summary)",
     acceptsArgs: true,
     requireAuth: true,
     handler: handleStateCommand,
@@ -745,7 +745,7 @@ export function register(pluginApi: any) {
     },
   }, { optional: true });
 
-  // 保留工具给其他频道 agent 用
+  // Register tools for agents in other channels
   pluginApi.registerTool(ccCallTool, { optional: true });
   pluginApi.registerTool(codexCallTool, { optional: true });
   pluginApi.registerTool(geminiCallTool, { optional: true });
