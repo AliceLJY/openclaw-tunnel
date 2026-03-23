@@ -1,9 +1,21 @@
+# openclaw-tunnel — Docker Compose
+#
+# Deployment scenarios:
+#   A) Local:  task-api in Docker on your machine, runner on the host (default)
+#   B) Cloud:  task-api on a cloud VM, runner on a separate machine
+#              Set WORKER_URL on runner to http://<cloud-ip>:3456
+#   C) Remote: Everything on cloud VMs — full compliance with container policies
+#
+# Security: WORKER_TOKEN authenticates all runner<->task-api communication.
+# For cloud deployment, restrict port access via firewall or reverse proxy.
+
 services:
   task-api:
     build:
       context: ./task-api
       dockerfile: Dockerfile
     ports:
+      # Expose to 0.0.0.0 for remote runner access; lock down with firewall in production
       - "${PORT:-3456}:${PORT:-3456}"
     environment:
       - WORKER_TOKEN=${WORKER_TOKEN}
@@ -12,7 +24,7 @@ services:
       - CALLBACK_API_BASE_URL=${CALLBACK_API_BASE_URL:-https://discord.com/api/v10}
       - WORKER_TASK_DB=/data/tasks.db
     volumes:
-      - tunnel-data:/data
+      - tunnel-data:/data    # Persistent storage for task DB + event DB
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "wget", "-q", "--spider", "http://localhost:${PORT:-3456}/health"]

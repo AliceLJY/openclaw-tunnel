@@ -1,6 +1,6 @@
 /**
- * 本地任务 API 服务
- * 运行在 Docker control plane 中，配合 local runner / reconciler 使用
+ * Local Task API Server
+ * Runs in the Docker control plane, used with the local runner / reconciler
  */
 
 import express from 'express';
@@ -17,7 +17,7 @@ function errorMessage(err) {
   return err instanceof Error ? err.message : String(err);
 }
 
-// ========== 配置 ==========
+// ========== Configuration ==========
 const AUTH_TOKEN = process.env.WORKER_TOKEN || 'change-me-to-a-secure-token';
 const PORT = process.env.WORKER_PORT || 3456;
 const DEFAULT_TASK_TIMEOUT_MS = 30000;
@@ -27,7 +27,7 @@ const MIN_TASK_TIMEOUT_MS = 1000;
 const MAX_TASK_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 const MAX_EVENTS = parseBoundedInt(process.env.WORKER_MAX_EVENTS, 2000, { min: 100, max: 500000 });
 const EVENT_RETENTION_DAYS = parseBoundedInt(process.env.WORKER_EVENT_RETENTION_DAYS, 14, { min: 1, max: 3650 });
-const EVENT_DB_PATH = process.env.WORKER_EVENT_DB || '/tmp/openclaw-runner-events.db';
+const EVENT_DB_PATH = process.env.WORKER_EVENT_DB || '/data/events.db';
 const TASK_DB_PATH = process.env.WORKER_TASK_DB || '/data/tasks.db';
 const CALLBACK_API_BASE_URL = process.env.CALLBACK_API_BASE_URL || process.env.DISCORD_API_BASE_URL || 'https://discord.com/api/v10';
 const TASK_EXPIRE_MS = parseBoundedInt(process.env.WORKER_TASK_RETENTION_MS, 20 * 60 * 1000, {
@@ -43,18 +43,18 @@ const SESSION_EXPIRE_MS = parseBoundedInt(process.env.WORKER_SESSION_RETENTION_M
   max: 30 * 24 * 60 * 60 * 1000,
 });
 
-// 启动强检（学自 Star-Office-UI security_utils）：弱 token 直接拒绝启动，不 warn 继续跑
+// Startup security check: reject weak tokens immediately instead of warning and continuing
 if (!AUTH_TOKEN || AUTH_TOKEN === 'change-me-to-a-secure-token' || AUTH_TOKEN.length < 16) {
-  console.error('❌ FATAL: WORKER_TOKEN 未设置或过弱（需 ≥16 位，不能用默认值）');
-  console.error('   请在 docker-compose.yml 或 .env 中设置 WORKER_TOKEN');
+  console.error('❌ FATAL: WORKER_TOKEN is not set or too weak (must be >= 16 chars, cannot use default)');
+  console.error('   Set WORKER_TOKEN in docker-compose.yml or .env');
   process.exit(1);
 }
 
-// ========== 持久化任务状态 ==========
+// ========== Persistent Task State ==========
 let eventDb = null;
 let taskDb = null;
 
-// ========== 认证中间件 ==========
+// ========== Auth Middleware ==========
 function parseBearerToken(headerValue) {
   if (typeof headerValue !== 'string') return '';
   const match = headerValue.match(/^Bearer\s+(.+)$/i);
@@ -757,9 +757,9 @@ app.use((err, req, res, next) => {
   return next(err);
 });
 
-// ========== API 路由 ==========
+// ========== API Routes ==========
 
-// 健康检查
+// Health check
 app.get('/health', (req, res) => {
   const queue = getQueueStats();
   const sessions = getSessionStats();
@@ -811,7 +811,7 @@ app.post('/events/maintenance', auth, (req, res) => {
   res.json(result);
 });
 
-// [云端 OpenClaw 调用] 提交任务
+// [Cloud OpenClaw] Submit task
 app.post('/tasks', auth, (req, res) => {
   const { command, timeout = DEFAULT_TASK_TIMEOUT_MS } = req.body || {};
   const normalizedCommand = normalizeString(command);
@@ -853,23 +853,23 @@ app.get('/sessions/state', auth, (req, res) => {
   });
 });
 
-// [云端 OpenClaw 调用] 查询结果（带等待窗口）
+// [Cloud OpenClaw] Query result (with wait window)
 app.get('/tasks/:taskId', auth, async (req, res) => {
   const { taskId } = req.params;
-  const waitMs = parseBoundedInt(req.query.wait, 0, { min: 0, max: MAX_POLL_WAIT_MS }); // 最多等待多少毫秒
+  const waitMs = parseBoundedInt(req.query.wait, 0, { min: 0, max: MAX_POLL_WAIT_MS }); // max wait in ms
 
   const startTime = Date.now();
 
-  // 等待窗口内检查结果
+  // Poll for result within the wait window
   while (Date.now() - startTime < waitMs) {
     const result = consumeTaskResult(taskId);
     if (result) {
       return res.json(result);
     }
-    await new Promise(r => setTimeout(r, 500)); // 每 500ms 检查一次
+    await new Promise(r => setTimeout(r, 500)); // check every 500ms
   }
 
-  // 超时或不等待，返回当前状态
+  // Timed out or no wait requested; return current status
   const result = consumeTaskResult(taskId);
   if (result) {
     return res.json(result);
@@ -883,17 +883,17 @@ app.get('/tasks/:taskId', auth, async (req, res) => {
   res.json({ status: task.status, message: 'Result not ready yet' });
 });
 
-// [本地 runner / reconciler 调用] 获取待执行任务（长连接领取）
+// [Local runner / reconciler] Claim next pending task (long-poll)
 app.get('/worker/poll', auth, async (req, res) => {
   const waitMs = parseBoundedInt(req.query.wait, DEFAULT_POLL_WAIT_MS, { min: 1000, max: MAX_POLL_WAIT_MS });
 
-  // 先立即检查一次
+  // Check immediately first
   const initialTask = claimNextPendingTask();
   if (initialTask) {
     return res.json(initialTask);
   }
 
-  // 长连接等待：hold 住连接，每 500ms 检查一次
+  // Long-poll: hold the connection, check every 500ms
   const startTime = Date.now();
   while (Date.now() - startTime < waitMs) {
     await new Promise(r => setTimeout(r, 500));
@@ -903,10 +903,10 @@ app.get('/worker/poll', auth, async (req, res) => {
     }
   }
 
-  res.json(null); // 超时，没有任务
+  res.json(null); // timed out, no tasks available
 });
 
-// [本地 Worker 调用] 上报结果
+// [Local worker] Report task result
 app.post('/worker/result', auth, (req, res) => {
   const { taskId, stdout, stderr, exitCode, error, metadata } = req.body || {};
 
@@ -958,7 +958,7 @@ app.post('/worker/result', auth, (req, res) => {
     console.log(`[Worker] Screenshot: ${metadata.screenshotPath}`);
   }
 
-  // 更新会话跟踪
+  // Update session tracking
   if (metadata?.sessionId) {
     touchSession(metadata.sessionId, {
       cliType: getSessionCliType(task?.type),
@@ -994,9 +994,9 @@ app.post('/worker/event', auth, (req, res) => {
   res.json({ success: true, event });
 });
 
-// ========== 文件写入 API（绕过 shell 转义问题） ==========
+// ========== File I/O API (bypasses shell escaping issues) ==========
 
-// [云端 OpenClaw 调用] 写入文件
+// [Cloud OpenClaw] Write file
 app.post('/files/write', auth, (req, res) => {
   const { path, content, encoding = 'utf8' } = req.body || {};
   const normalizedPath = normalizeString(path);
@@ -1009,7 +1009,7 @@ app.post('/files/write', auth, (req, res) => {
     type: 'file-write',
     path: normalizedPath,
     content,
-    encoding, // 'utf8' 或 'base64'
+    encoding, // 'utf8' or 'base64'
   });
 
   console.log(`[File] Write: ${task.id} - ${normalizedPath}`);
@@ -1017,7 +1017,7 @@ app.post('/files/write', auth, (req, res) => {
   res.json({ taskId: task.id, message: 'File write task created' });
 });
 
-// [云端 OpenClaw 调用] 读取文件
+// [Cloud OpenClaw] Read file
 app.post('/files/read', auth, (req, res) => {
   const { path } = req.body || {};
   const normalizedPath = normalizeString(path);
@@ -1036,7 +1036,7 @@ app.post('/files/read', auth, (req, res) => {
   res.json({ taskId: task.id, message: 'File read task created' });
 });
 
-// [云端 OpenClaw 调用] 编辑文件（局部替换）
+// [Cloud OpenClaw] Edit file (partial string replacement)
 app.post('/files/edit', auth, (req, res) => {
   const { path, old_string, new_string, replace_all = false } = req.body || {};
   const normalizedPath = normalizeString(path);
@@ -1058,9 +1058,9 @@ app.post('/files/edit', auth, (req, res) => {
   res.json({ taskId: task.id, message: 'File edit task created' });
 });
 
-// ========== Claude CLI API（调用本地 Claude Code） ==========
+// ========== Claude CLI API (invoke local Claude Code) ==========
 
-// [云端 OpenClaw 调用] 执行本地 Claude Code CLI
+// [Cloud OpenClaw] Execute local Claude Code CLI
 app.post('/claude', auth, (req, res) => {
   const { prompt, timeout = 120000, sessionId, callbackChannel, callbackBotToken } = req.body || {};
   const promptText = typeof prompt === 'string' ? prompt : '';
@@ -1071,7 +1071,7 @@ app.post('/claude', auth, (req, res) => {
     return res.status(400).json({ error: 'prompt is required' });
   }
 
-  // 自动生成 sessionId：确保每轮 CC 都有可追踪的 session，支持后续 --resume
+  // Auto-generate sessionId: ensures every CC invocation has a trackable session for --resume
   const effectiveSessionId = requestedSessionId || crypto.randomUUID();
   const task = enqueueTask({
     type: 'claude-cli',
@@ -1083,7 +1083,7 @@ app.post('/claude', auth, (req, res) => {
     ...dispatchMeta,
   });
 
-  // 更新会话跟踪
+  // Update session tracking
   touchSession(effectiveSessionId, {
     cliType: 'claude',
     callbackChannel: task.callbackChannel,
@@ -1099,7 +1099,7 @@ app.post('/claude', auth, (req, res) => {
 
 // ========== Codex / Gemini CLI API ==========
 
-// [Discord/Telegram bridge 调用] 提交 Codex CLI 任务（支持 session）
+// [Discord/Telegram bridge] Submit Codex CLI task (with session support)
 app.post('/codex', auth, (req, res) => {
   const { prompt, timeout = 300000, sessionId, model, callbackChannel, callbackBotToken } = req.body || {};
   const promptText = typeof prompt === 'string' ? prompt : '';
@@ -1134,7 +1134,7 @@ app.post('/codex', auth, (req, res) => {
   res.json({ taskId: task.id, sessionId: effectiveSessionId, message: 'Codex CLI task created' });
 });
 
-// [Discord/Telegram bridge 调用] 提交 Gemini CLI 任务（支持 session）
+// [Discord/Telegram bridge] Submit Gemini CLI task (with session support)
 app.post('/gemini', auth, (req, res) => {
   const { prompt, timeout = 300000, sessionId, resumeLatest, model, callbackChannel, callbackBotToken } = req.body || {};
   const promptText = typeof prompt === 'string' ? prompt : '';
@@ -1172,7 +1172,7 @@ app.post('/gemini', auth, (req, res) => {
 
 // ========== Bot callback push (current compatibility path defaults to Discord API) ==========
 
-// 让 bridge / hook 通过 task-api 代发 bot callback（当前默认兼容 Discord channel message API）
+// Let bridge / hook send bot callbacks through task-api (currently defaults to Discord channel message API)
 app.post('/notify', auth, async (req, res) => {
   const channel = normalizeString(req.body?.channel);
   const message = typeof req.body?.message === 'string' ? req.body.message : '';
@@ -1205,9 +1205,9 @@ app.post('/notify', auth, async (req, res) => {
   }
 });
 
-// ========== 会话管理 API ==========
+// ========== Session Management API ==========
 
-// [云端 OpenClaw 调用] 列出活跃会话
+// [Cloud OpenClaw] List active sessions
 app.get('/claude/sessions', auth, (req, res) => {
   const sessions = listActiveSessions({ limit: 200, cliType: 'claude' }).map((session) => ({
     sessionId: session.sessionId,
@@ -1218,12 +1218,12 @@ app.get('/claude/sessions', auth, (req, res) => {
   res.json({ sessions });
 });
 
-// [本地调用] 列出最近的 CC 会话（含话题摘要）
+// [Local] List recent CC sessions (with topic summary)
 app.get('/claude/recent', auth, async (req, res) => {
   const limit = parseRecentLimit(req.query.limit);
   const { fs, path, readline } = await loadSessionModules();
 
-  // 扫描 CC session 文件（容器内挂载路径，宿主机 ~/.claude/projects）
+  // Scan CC session files (container mount path, host ~/.claude/projects)
   const projectsDir = '/host-claude-projects';
   const sessions = [];
 
@@ -1247,11 +1247,11 @@ app.get('/claude/recent', auth, async (req, res) => {
     return res.json({ sessions: [], error: errorMessage(e) });
   }
 
-  // 按修改时间倒序，取最近 N 个
+  // Sort by mtime descending, take most recent N
   sessions.sort((a, b) => b.mtime - a.mtime);
   const recent = sessions.slice(0, limit);
 
-  // 提取每个会话的第一条 user 消息作为话题
+  // Extract the first user message from each session as the topic
   const results = [];
   for (const s of recent) {
     const topic = await extractSessionTopic(s.path, fs, readline, (record) => {
@@ -1271,18 +1271,18 @@ app.get('/claude/recent', auth, async (req, res) => {
   res.json({ sessions: results });
 });
 
-// [本地调用] 列出最近的 Codex 会话（含话题摘要）
+// [Local] List recent Codex sessions (with topic summary)
 app.get('/codex/recent', auth, async (req, res) => {
   const limit = parseRecentLimit(req.query.limit);
   const { fs, path, readline } = await loadSessionModules();
 
-  // 扫描 Codex session 文件（容器内挂载路径，宿主机 ~/.codex/sessions）
-  // 目录结构：YYYY/MM/DD/rollout-{timestamp}-{uuid}.jsonl
+  // Scan Codex session files (container mount path, host ~/.codex/sessions)
+  // Directory structure: YYYY/MM/DD/rollout-{timestamp}-{uuid}.jsonl
   const sessionsDir = '/host-codex-sessions';
   const sessionFiles = [];
 
   try {
-    // 只扫最近 7 天的目录
+    // Only scan directories for the last 7 days
     const now = new Date();
     for (let d = 0; d < 7; d++) {
       const date = new Date(now - d * 86400000);
@@ -1297,23 +1297,23 @@ app.get('/codex/recent', auth, async (req, res) => {
           .map(f => {
             const fp = path.join(dayDir, f);
             const stat = fs.statSync(fp);
-            // 从文件名提取末尾 UUID（兼容 rollout-2026-03-02T12-33-14-{uuid}.jsonl）
+            // Extract trailing UUID from filename (compatible with rollout-2026-03-02T12-33-14-{uuid}.jsonl)
             const uuidMatch = f.match(/([0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.jsonl$/i);
             const sessionId = uuidMatch ? uuidMatch[1] : f.replace('.jsonl', '');
             return { file: f, path: fp, mtime: stat.mtimeMs, size: stat.size, sessionId };
           });
         sessionFiles.push(...files);
-      } catch { /* 该天目录不存在，跳过 */ }
+      } catch { /* day directory does not exist, skip */ }
     }
   } catch (e) {
     return res.json({ sessions: [], error: errorMessage(e) });
   }
 
-  // 按修改时间倒序，取最近 N 个
+  // Sort by mtime descending, take most recent N
   sessionFiles.sort((a, b) => b.mtime - a.mtime);
   const recent = sessionFiles.slice(0, limit);
 
-  // 提取每个会话的第一条 user 消息作为话题
+  // Extract the first user message from each session as the topic
   const results = [];
   for (const s of recent) {
     const topic = await extractSessionTopic(s.path, fs, readline, (record) => {
@@ -1340,7 +1340,7 @@ app.get('/codex/recent', auth, async (req, res) => {
   res.json({ sessions: results });
 });
 
-// ========== 清理过期任务 ==========
+// ========== Cleanup Expired Tasks ==========
 setInterval(() => {
   const now = Date.now();
   const db = getTaskDb();
@@ -1371,7 +1371,7 @@ setInterval(() => {
   trimEvents();
 }, 60000);
 
-// ========== 启动 ==========
+// ========== Startup ==========
 app.listen(PORT, '0.0.0.0', () => {
   const requeued = resetStaleRunningTasks();
   const queue = getQueueStats();

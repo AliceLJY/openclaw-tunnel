@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 /**
- * Mac 本地 Runner / Reconciler
- * Agent SDK 版本：流式输出 + 会话管理
+ * Host Runner / Reconciler
+ * Agent SDK mode: streaming output + session management
  *
- * 运行: npm run runner
- * 或: WORKER_URL=https://xxx WORKER_TOKEN=xxx npm run runner
+ * Run: npm run runner
+ * Or: WORKER_URL=https://xxx WORKER_TOKEN=xxx npm run runner
  */
 
 import { exec, spawn, execFile } from 'child_process';
@@ -14,7 +14,7 @@ import fs from 'fs';
 import path from 'path';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 
-// 防止嵌套检测（从 CC 内部启动时需要）
+// Prevent nesting detection (needed when launched from within CC)
 delete process.env.CLAUDECODE;
 
 function parseConfigInt(value, fallback, min = 1, max = Number.MAX_SAFE_INTEGER) {
@@ -25,35 +25,35 @@ function parseConfigInt(value, fallback, min = 1, max = Number.MAX_SAFE_INTEGER)
   return parsed;
 }
 
-// ========== Agent SDK 加载（失败则回退 CLI） ==========
+// ========== Agent SDK loading (falls back to CLI on failure) ==========
 let sdkQuery;
 try {
   const sdk = await import('@anthropic-ai/claude-agent-sdk');
   sdkQuery = sdk.query;
-  console.log('[SDK] Agent SDK 加载成功');
+  console.log('[SDK] Agent SDK loaded successfully');
 } catch (e) {
-  console.warn(`[SDK] Agent SDK 加载失败，将使用 CLI 模式: ${e.message}`);
+  console.warn(`[SDK] Agent SDK load failed, falling back to CLI mode: ${e.message}`);
 }
 
-// ========== 配置 ==========
+// ========== Configuration ==========
 const CONFIG = {
-  // 云端任务 API 地址（改成你的腾讯云服务器）
+  // Task API URL (set via WORKER_URL env var)
   serverUrl: process.env.WORKER_URL || 'http://127.0.0.1:3456',
-  // 认证 Token（和云端保持一致）
+  // Auth token (must match the cloud endpoint)
   token: process.env.WORKER_TOKEN || 'change-me-to-a-secure-token',
-  // 调和循环等待间隔（毫秒） - 仅在并发满时使用
+  // Reconcile loop poll interval (ms) - only used when concurrency is full
   pollInterval: parseConfigInt(process.env.POLL_INTERVAL, 500, 50, 60000),
-  // 调和领取窗口（毫秒） - 服务器 hold 住连接的时间
+  // Long-poll claim window (ms) - how long the server holds the connection
   longPollWait: parseConfigInt(process.env.LONG_POLL_WAIT, 30000, 1000, 300000),
-  // 最大并发任务数
+  // Max concurrent tasks
   maxConcurrent: parseConfigInt(process.env.MAX_CONCURRENT, 5, 1, 50),
-  // 命令执行超时（毫秒）- 10分钟，适配 Gemini/Codex 慢任务
+  // Command execution timeout (ms) - 10 min, accommodates slow Gemini/Codex tasks
   defaultTimeout: 600000,
-  // OpenClaw Hooks 回调配置（CC 完成后通知 bot）
+  // OpenClaw Hooks callback config (notify bot after CC completes)
   openclawHooksUrl: process.env.OPENCLAW_HOOKS_URL || 'http://127.0.0.1:18791',
   openclawHooksToken: process.env.OPENCLAW_HOOKS_TOKEN || 'cc-callback-2026',
   callbackApiBaseUrl: process.env.CALLBACK_API_BASE_URL || 'https://discord.com/api/v10',
-  // runner 本地 provider session cache，仅供本机 resume / 映射恢复使用
+  // Runner local provider session cache, used only for local resume / mapping recovery
   runnerSessionCacheFile: process.env.RUNNER_SESSION_CACHE_FILE || '/tmp/openclaw-runner-session-cache.json',
 };
 
@@ -62,25 +62,25 @@ if (CONFIG.token === 'change-me-to-a-secure-token') {
 }
 
 console.log('========================================');
-console.log('  Docker-first Local Runner 启动');
+console.log('  Docker-first Local Runner started');
 console.log('========================================');
 console.log(`Task API: ${CONFIG.serverUrl}`);
-console.log(`调和等待窗口: ${CONFIG.longPollWait}ms`);
-console.log(`最大并发: ${CONFIG.maxConcurrent} 个任务`);
-console.log(`执行模式: ${sdkQuery ? 'Agent SDK (优先)' : 'CLI (回退)'}`);
+console.log(`Long-poll window: ${CONFIG.longPollWait}ms`);
+console.log(`Max concurrency: ${CONFIG.maxConcurrent} tasks`);
+console.log(`Execution mode: ${sdkQuery ? 'Agent SDK (preferred)' : 'CLI (fallback)'}`);
 console.log(`Runner cache: ${CONFIG.runnerSessionCacheFile}`);
 console.log('');
-console.log('支持的任务类型:');
-console.log('  - command: 执行 shell 命令');
-console.log('  - file-read: 读取文件');
-console.log('  - file-write: 写入文件');
-console.log('  - file-edit: 编辑文件（局部替换）');
-console.log('  - claude-cli: 调用本地 Claude Code (SDK/CLI)');
-console.log('  - codex-cli: 调用本地 Codex CLI');
-console.log('  - gemini-cli: 调用本地 Gemini CLI');
+console.log('Supported task types:');
+console.log('  - command: execute shell command');
+console.log('  - file-read: read file');
+console.log('  - file-write: write file');
+console.log('  - file-edit: edit file (partial replacement)');
+console.log('  - claude-cli: invoke local Claude Code (SDK/CLI)');
+console.log('  - codex-cli: invoke local Codex CLI');
+console.log('  - gemini-cli: invoke local Gemini CLI');
 console.log('');
 
-// ========== HTTP 请求封装 ==========
+// ========== HTTP request helper ==========
 function request(method, urlPath, body = null) {
   return new Promise((resolve, reject) => {
     const url = new URL(urlPath, CONFIG.serverUrl);
@@ -111,7 +111,7 @@ function request(method, urlPath, body = null) {
     });
 
     req.on('error', reject);
-    // 调和领取请求的超时要大于服务器 hold 时间，避免提前断开
+    // Poll request timeout must exceed server hold time to avoid premature disconnect
     const reqTimeout = urlPath.includes('/worker/poll') ? CONFIG.longPollWait + 5000 : 10000;
     req.setTimeout(reqTimeout, () => {
       req.destroy();
@@ -125,8 +125,8 @@ function request(method, urlPath, body = null) {
   });
 }
 
-// ========== 执行命令 ==========
-// NOTE: exec() 在此处是有意使用的——worker 本身就是命令执行服务
+// ========== Execute command ==========
+// NOTE: exec() is intentionally used here -- the worker IS a command execution service
 function executeCommand(command, timeout) {
   return new Promise((resolve) => {
     const startTime = Date.now();
@@ -155,7 +155,7 @@ function executeCommand(command, timeout) {
   });
 }
 
-// ========== 文件操作 ==========
+// ========== File operations ==========
 function expandHome(filePath) {
   if (filePath.startsWith('~/')) {
     return path.join(process.env.HOME, filePath.slice(2));
@@ -168,7 +168,7 @@ function writeFileToDisk(filePath, content, encoding) {
     try {
       const cleanPath = filePath.trim();
       const fullPath = expandHome(cleanPath);
-      console.log(`[写入] ${fullPath}`);
+      console.log(`[Write] ${fullPath}`);
 
       const dir = path.dirname(fullPath);
       if (!fs.existsSync(dir)) {
@@ -223,7 +223,7 @@ function editFileOnDisk(filePath, oldString, newString, replaceAll) {
   return new Promise((resolve) => {
     try {
       const fullPath = expandHome(filePath.trim());
-      console.log(`[编辑] ${fullPath}`);
+      console.log(`[Edit] ${fullPath}`);
 
       if (!fs.existsSync(fullPath)) {
         return resolve({
@@ -246,7 +246,7 @@ function editFileOnDisk(filePath, oldString, newString, replaceAll) {
       }
 
       if (!replaceAll) {
-        // 非全局替换时，检查 old_string 是否唯一
+        // For non-global replace, check that old_string is unique
         const count = content.split(oldString).length - 1;
         if (count > 1) {
           return resolve({
@@ -280,13 +280,13 @@ function editFileOnDisk(filePath, oldString, newString, replaceAll) {
   });
 }
 
-// ========== Runner 本地 provider session cache ==========
-// 职责单一：只用于 runner 重启后恢复 SDK session resume。
-// 权威状态在 server.js 的 taskDb/sessionDb（SQLite），这里不是第二个状态主人。
+// ========== Runner local provider session cache ==========
+// Single responsibility: only used to recover SDK session resume after runner restart.
+// Authoritative state lives in server.js taskDb/sessionDb (SQLite); this is not a second source of truth.
 const SESSION_FILE = CONFIG.runnerSessionCacheFile;
 const liveSessions = new Map();   // sdkSessionId → { lastActivity, callbackChannel }
-const sessionIdMap = new Map();   // taskApiSessionId → sdkSessionId（映射表）
-const ccSessions = new Set();     // CLI 模式用：跟踪已创建的 CC 会话
+const sessionIdMap = new Map();   // taskApiSessionId → sdkSessionId (mapping table)
+const ccSessions = new Set();     // CLI mode: tracks created CC sessions
 
 function rememberMappedSession(taskApiId, providerSessionId, callbackChannel) {
   if (!providerSessionId) return;
@@ -324,7 +324,7 @@ function listRecentCodexSessions(days = 30) {
         });
       sessionFiles.push(...files);
     } catch {
-      // 该天目录不存在，跳过
+      // Day directory doesn't exist, skip
     }
   }
 
@@ -343,7 +343,7 @@ function resolveCodexSessionId(sessionId) {
 
   if (candidates.length > 0) {
     if (candidates[0].sessionId !== sessionId) {
-      console.log(`[Codex Session] 前缀匹配: ${sessionId} → ${candidates[0].sessionId}`);
+      console.log(`[Codex Session] Prefix match: ${sessionId} → ${candidates[0].sessionId}`);
     }
     return candidates[0].sessionId;
   }
@@ -351,10 +351,10 @@ function resolveCodexSessionId(sessionId) {
   return null;
 }
 
-// 短 ID 前缀匹配：/cc-recent 显示 8 位截断 ID，resume 需要完整 UUID
+// Short ID prefix match: /cc-recent shows 8-char truncated IDs, resume needs full UUID
 function resolveSessionPrefix(prefix) {
   if (!prefix) return prefix;
-  // 已经是完整 UUID（含连字符 36 位，纯 hex 32 位）→ 直接返回
+  // Already a full UUID (36 chars with hyphens, 32 chars hex) → return as-is
   if (prefix.length >= 32) return prefix;
 
   const sessionDir = path.join(process.env.HOME, '.claude', 'projects', '-Users-' + path.basename(process.env.HOME));
@@ -363,19 +363,19 @@ function resolveSessionPrefix(prefix) {
     const matches = files.filter(f => f.startsWith(prefix) && f.endsWith('.jsonl'));
     if (matches.length === 1) {
       const fullId = matches[0].replace('.jsonl', '');
-      console.log(`[Session] 前缀匹配: ${prefix} → ${fullId}`);
+      console.log(`[Session] Prefix match: ${prefix} → ${fullId}`);
       return fullId;
     } else if (matches.length > 1) {
-      // 多个匹配 → 取最近修改的
+      // Multiple matches → pick the most recently modified
       const sorted = matches
         .map(f => ({ file: f, mtime: fs.statSync(path.join(sessionDir, f)).mtimeMs }))
         .sort((a, b) => b.mtime - a.mtime);
       const fullId = sorted[0].file.replace('.jsonl', '');
-      console.log(`[Session] 前缀 ${prefix} 匹配到 ${matches.length} 个会话，取最新: ${fullId}`);
+      console.log(`[Session] Prefix ${prefix} matched ${matches.length} sessions, using latest: ${fullId}`);
       return fullId;
     }
-  } catch { /* 目录不存在 */ }
-  return prefix; // 没找到，返回原值让下游处理
+  } catch { /* directory doesn't exist */ }
+  return prefix; // Not found, return original value for downstream handling
 }
 
 function loadSessions() {
@@ -387,20 +387,20 @@ function loadSessions() {
         callbackChannel: s.callbackChannel
       });
       ccSessions.add(s.sessionId);
-      // 恢复映射关系
+      // Restore mapping
       if (s.taskApiId) {
         sessionIdMap.set(s.taskApiId, s.sessionId);
       }
     }
-    console.log(`[会话] 恢复了 ${liveSessions.size} 个 runner cache 记录`);
+    console.log(`[Session] Restored ${liveSessions.size} runner cache entries`);
   } catch {
-    // 文件不存在或格式错误，忽略
+    // File doesn't exist or malformed, ignore
   }
 }
 
 function saveSessions() {
   try {
-    // 反向查找 taskApiId
+    // Reverse lookup taskApiId
     const reverseMap = new Map();
     for (const [taskApiId, sdkId] of sessionIdMap) {
       reverseMap.set(sdkId, taskApiId);
@@ -413,22 +413,22 @@ function saveSessions() {
     }));
     fs.writeFileSync(SESSION_FILE, JSON.stringify(data, null, 2));
   } catch (e) {
-    console.error('[会话] 保存失败:', e.message);
+    console.error('[Session] Save failed:', e.message);
   }
 }
 
 loadSessions();
 
-// 注：runner 本地 cache 的过期清理由 server 侧 cleanupExpiredSessions() 统一管理。
-// runner 这里不再另起定时器，避免双重清理职责混淆。
+// Note: expiry cleanup of runner local cache is managed by server-side cleanupExpiredSessions().
+// Runner does not run its own cleanup timer to avoid conflicting dual-ownership.
 
 // ========== Bot callback push (current compatibility path defaults to Discord API) ==========
 const CALLBACK_BOT_TOKEN = process.env.CALLBACK_BOT_TOKEN || '';
-const DISCORD_PROXY = process.env.DISCORD_PROXY || 'http://127.0.0.1:7897';
+const DISCORD_PROXY = process.env.DISCORD_PROXY || '';
 
 /**
- * 通过可注入的 bot callback API 发送消息。
- * 当前默认仍是 Discord channel message API；https 场景可选走代理。
+ * Send a message via the injectable bot callback API.
+ * Currently defaults to the Discord channel message API; HTTPS can optionally use a proxy.
  */
 function discordPost(channelId, content, botToken) {
   const token = botToken || CALLBACK_BOT_TOKEN;
@@ -483,19 +483,19 @@ function notifyDiscord(callbackChannel, sessionId, text, prefix, botToken) {
     const backoff = Math.min(attempt * 3000, 15000);
     discordPost(callbackChannel, message, botToken).then(({ status, data }) => {
       if (status >= 200 && status < 300) {
-        console.log(`[回调] 推送成功 (${prefix})${attempt > 1 ? ` [第${attempt}次]` : ''}`);
+        console.log(`[Callback] Push succeeded (${prefix})${attempt > 1 ? ` [attempt #${attempt}]` : ''}`);
       } else if (attempt < maxRetries) {
-        console.error(`[回调] 第${attempt}次失败 (${status})，${backoff/1000}s 后重试`);
+        console.error(`[Callback] Attempt #${attempt} failed (${status}), retrying in ${backoff/1000}s`);
         setTimeout(trySend, backoff);
       } else {
-        console.error(`[回调] ${maxRetries}次均失败 (${status}): ${typeof data === 'string' ? data.slice(0, 100) : ''}`);
+        console.error(`[Callback] All ${maxRetries} attempts failed (${status}): ${typeof data === 'string' ? data.slice(0, 100) : ''}`);
       }
     }).catch(err => {
       if (attempt < maxRetries) {
-        console.error(`[回调] 第${attempt}次错误，${backoff/1000}s 后重试: ${err.message}`);
+        console.error(`[Callback] Attempt #${attempt} error, retrying in ${backoff/1000}s: ${err.message}`);
         setTimeout(trySend, backoff);
       } else {
-        console.error(`[回调] ${maxRetries}次均失败: ${err.message}`);
+        console.error(`[Callback] All ${maxRetries} attempts failed: ${err.message}`);
       }
     });
   }
@@ -503,7 +503,7 @@ function notifyDiscord(callbackChannel, sessionId, text, prefix, botToken) {
   trySend();
 }
 
-// ========== 消息过滤 & 格式化（SDK 模式用） ==========
+// ========== Message filtering & formatting (SDK mode) ==========
 const SILENT_TOOLS = new Set([
   'TodoWrite', 'TaskCreate', 'TaskUpdate', 'TaskList', 'TaskGet'
 ]);
@@ -533,38 +533,38 @@ function formatAssistantMessage(msg) {
   return parts.length > 0 ? parts.join('\n') : null;
 }
 
-// ========== Agent SDK 执行 ==========
+// ========== Agent SDK execution ==========
 async function executeClaudeSDK(prompt, timeout, sessionId, callbackChannel, model) {
   const startTime = Date.now();
 
-  // 判断 sessionId 是否对应一个真实的 CC session 文件（终端开的会话）
-  // 如果是，直接用它做 resume，不走 sessionIdMap（避免脏映射覆盖）
+  // Check if sessionId corresponds to a real CC session file (terminal session).
+  // If so, resume it directly without going through sessionIdMap (avoids stale mapping override).
   let sdkSessionId = null;
   if (sessionId) {
     const projectDir = path.join(process.env.HOME, '.claude', 'projects', '-Users-' + path.basename(process.env.HOME));
     const sessionFile = path.join(projectDir, sessionId + '.jsonl');
     if (fs.existsSync(sessionFile)) {
-      // 真实 CC session 文件存在 → 直接 resume 这个终端会话
+      // Real CC session file exists → resume this terminal session directly
       sdkSessionId = sessionId;
     } else {
-      // 精确文件不存在 → 先尝试短 ID 前缀匹配
+      // Exact file not found → try short ID prefix match first
       if (!sessionId.includes('-') || sessionId.length < 36) {
         try {
           const matches = fs.readdirSync(projectDir)
             .filter(f => f.startsWith(sessionId) && f.endsWith('.jsonl'));
           if (matches.length === 1) {
             sdkSessionId = matches[0].replace('.jsonl', '');
-            console.log(`[SDK] 短 ID 前缀匹配: ${sessionId} → ${sdkSessionId.slice(0, 8)}...`);
+            console.log(`[SDK] Short ID prefix match: ${sessionId} → ${sdkSessionId.slice(0, 8)}...`);
           } else if (matches.length > 1) {
-            console.warn(`[SDK] 短 ID ${sessionId} 匹配到 ${matches.length} 个 session，跳过`);
+            console.warn(`[SDK] Short ID ${sessionId} matched ${matches.length} sessions, skipping`);
           }
-        } catch { /* projectDir 不存在 */ }
+        } catch { /* projectDir doesn't exist */ }
       }
-      // 前缀也没匹配到 → 走 sessionIdMap 映射
+      // Prefix match also failed → fall back to sessionIdMap lookup
       if (!sdkSessionId) {
         sdkSessionId = sessionIdMap.get(sessionId) || null;
         if (!sdkSessionId) {
-          // 从文件重新加载映射（其他 worker 进程可能已写入）
+          // Reload mapping from file (other worker processes may have written it)
           try {
             const data = JSON.parse(fs.readFileSync(SESSION_FILE, 'utf8'));
             for (const s of data) {
@@ -576,18 +576,18 @@ async function executeClaudeSDK(prompt, timeout, sessionId, callbackChannel, mod
               }
             }
             sdkSessionId = sessionIdMap.get(sessionId) || null;
-            if (sdkSessionId) console.log(`[SDK] 从文件恢复映射: API:${sessionId.slice(0, 8)} → SDK:${sdkSessionId.slice(0, 8)}`);
-          } catch { /* 文件不存在或格式错误 */ }
+            if (sdkSessionId) console.log(`[SDK] Mapping restored from file: API:${sessionId.slice(0, 8)} → SDK:${sdkSessionId.slice(0, 8)}`);
+          } catch { /* file doesn't exist or malformed */ }
         }
       }
     }
   }
   const isResume = !!sdkSessionId;
 
-  console.log(`[SDK] ${isResume ? '续接' : '新建'}会话: "${prompt.slice(0, 50)}..."${sessionId ? ' [API:' + sessionId.slice(0, 8) + (sdkSessionId ? ' → SDK:' + sdkSessionId.slice(0, 8) : '') + ']' : ''}`);
+  console.log(`[SDK] ${isResume ? 'Resuming' : 'New'} session: "${prompt.slice(0, 50)}..."${sessionId ? ' [API:' + sessionId.slice(0, 8) + (sdkSessionId ? ' → SDK:' + sdkSessionId.slice(0, 8) : '') + ']' : ''}`);
 
-  // 构建 options（resume 也需要权限配置，否则子进程立即退出）
-  // model 由调用方传入，支持 fallback 重试
+  // Build options (resume also needs permission config, otherwise subprocess exits immediately).
+  // model is passed in by the caller, supports fallback retry.
   const baseOptions = {
     model: model || 'claude-opus-4-6',
     permissionMode: 'bypassPermissions',
@@ -602,14 +602,14 @@ async function executeClaudeSDK(prompt, timeout, sessionId, callbackChannel, mod
         systemPrompt: { type: 'preset', preset: 'claude_code' },
       };
 
-  // 流式输出 debounce
+  // Streaming output debounce
   let buffer = [];
   let debounceTimer = null;
   const DEBOUNCE_MS = 3000;
   let capturedSessionId = sessionId || null;
 
   function flush() {
-    // 不推流式进度到 bot chat，保持干净的聊天体验
+    // Don't push streaming progress to bot chat, keep a clean chat experience
     buffer = [];
     debounceTimer = null;
   }
@@ -618,7 +618,7 @@ async function executeClaudeSDK(prompt, timeout, sessionId, callbackChannel, mod
   let resultSubtype = 'success';
   let resultErrors = [];
 
-  // 超时保护
+  // Timeout guard
   const timeoutMs = (timeout || CONFIG.defaultTimeout) + 30000;
   const abortController = new AbortController();
   const timeoutHandle = setTimeout(() => {
@@ -630,13 +630,13 @@ async function executeClaudeSDK(prompt, timeout, sessionId, callbackChannel, mod
       prompt,
       options: { ...options, abortController }
     })) {
-      // 捕获 session ID
+      // Capture session ID
       if (message.type === 'system' && message.subtype === 'init') {
         capturedSessionId = message.session_id;
-        console.log(`[SDK] 会话 ID: ${capturedSessionId.slice(0, 8)}`);
+        console.log(`[SDK] Session ID: ${capturedSessionId.slice(0, 8)}`);
       }
 
-      // 格式化 assistant 消息
+      // Format assistant message
       if (message.type === 'assistant') {
         const formatted = formatAssistantMessage(message);
         if (formatted) {
@@ -647,7 +647,7 @@ async function executeClaudeSDK(prompt, timeout, sessionId, callbackChannel, mod
         }
       }
 
-      // 捕获最终结果
+      // Capture final result
       if (message.type === 'result') {
         resultSubtype = message.subtype;
         if (message.subtype === 'success') {
@@ -656,7 +656,7 @@ async function executeClaudeSDK(prompt, timeout, sessionId, callbackChannel, mod
           resultErrors = message.errors || [];
           resultText = resultErrors.join('\n');
         }
-        console.log(`[SDK] 结果: ${message.subtype}, 耗时 ${message.duration_ms}ms, 花费 $${message.total_cost_usd?.toFixed(4) || '?'}`);
+        console.log(`[SDK] Result: ${message.subtype}, took ${message.duration_ms}ms, cost $${message.total_cost_usd?.toFixed(4) || '?'}`);
       }
     }
   } catch (err) {
@@ -665,7 +665,7 @@ async function executeClaudeSDK(prompt, timeout, sessionId, callbackChannel, mod
     flush();
 
     const isAbort = err.name === 'AbortError' || abortController.signal.aborted;
-    console.error(`[SDK] ${isAbort ? '超时' : '错误'}: ${err.message}`);
+    console.error(`[SDK] ${isAbort ? 'Timeout' : 'Error'}: ${err.message}`);
 
     return {
       stdout: resultText || '',
@@ -679,28 +679,28 @@ async function executeClaudeSDK(prompt, timeout, sessionId, callbackChannel, mod
 
   clearTimeout(timeoutHandle);
   if (debounceTimer) clearTimeout(debounceTimer);
-  buffer = [];   // 清空残余，避免与 notifyCompletion 重复发送
+  buffer = [];   // Clear residual to avoid duplicate sends with notifyCompletion
   flush();
 
   const duration = Date.now() - startTime;
 
-  // 更新会话池 + 映射表
+  // Update session pool + mapping table
   if (capturedSessionId) {
     liveSessions.set(capturedSessionId, {
       lastActivity: Date.now(),
       callbackChannel
     });
-    // Task API sessionId → SDK session_id 映射
+    // Task API sessionId → SDK session_id mapping
     if (sessionId && sessionId !== capturedSessionId) {
       sessionIdMap.set(sessionId, capturedSessionId);
-      console.log(`[SDK] 映射: API:${sessionId.slice(0, 8)} → SDK:${capturedSessionId.slice(0, 8)}`);
+      console.log(`[SDK] Mapping: API:${sessionId.slice(0, 8)} → SDK:${capturedSessionId.slice(0, 8)}`);
     }
     ccSessions.add(capturedSessionId);
     saveSessions();
   }
 
   const isError = resultSubtype !== 'success';
-  console.log(`[SDK] 完成，耗时 ${duration}ms，结果 ${resultText.length} 字符`);
+  console.log(`[SDK] Done, took ${duration}ms, result ${resultText.length} chars`);
 
   return {
     stdout: resultText,
@@ -712,12 +712,12 @@ async function executeClaudeSDK(prompt, timeout, sessionId, callbackChannel, mod
   };
 }
 
-// ========== Codex CLI 执行（支持 session 续接 + 指定模型）==========
+// ========== Codex CLI execution (supports session resume + model selection) ==========
 function executeCodexCLI(prompt, timeout, sessionId, model) {
   return new Promise((resolve) => {
     const startTime = Date.now();
     const resolvedSessionId = resolveCodexSessionId(sessionId);
-    console.log(`[Codex CLI] 执行${model ? ' [' + model + ']' : ''}: "${prompt.slice(0, 50)}..."${resolvedSessionId ? ' [resume:' + resolvedSessionId.slice(0, 8) + ']' : ''}`);
+    console.log(`[Codex CLI] Executing${model ? ' [' + model + ']' : ''}: "${prompt.slice(0, 50)}..."${resolvedSessionId ? ' [resume:' + resolvedSessionId.slice(0, 8) + ']' : ''}`);
 
     const args = ['exec'];
     if (resolvedSessionId) {
@@ -752,10 +752,10 @@ function executeCodexCLI(prompt, timeout, sessionId, model) {
     child.on('close', (code) => {
       clearTimeout(timer);
       const duration = Date.now() - startTime;
-      // 从 stderr 提取 session id（格式：session id: <uuid>）
+      // Extract session id from stderr (format: session id: <uuid>)
       const sessionMatch = stderr.match(/session id:\s*([a-f0-9-]+)/i);
       const capturedSessionId = sessionMatch ? sessionMatch[1] : null;
-      console.log(`[Codex CLI] 完成，耗时 ${duration}ms，输出 ${stdout.length} 字节${capturedSessionId ? '，session:' + capturedSessionId.slice(0, 8) : ''}`);
+      console.log(`[Codex CLI] Done, took ${duration}ms, output ${stdout.length} bytes${capturedSessionId ? ', session:' + capturedSessionId.slice(0, 8) : ''}`);
       resolve({
         stdout: stdout.trim(), stderr: stderr.trim(),
         exitCode: code || 0, error: code ? `Exit code ${code}` : null, duration,
@@ -773,7 +773,7 @@ function executeCodexCLI(prompt, timeout, sessionId, model) {
   });
 }
 
-// ========== Gemini CLI 执行（支持 session 续接）==========
+// ========== Gemini CLI execution (supports session resume) ==========
 const DEFAULT_GEMINI_REPLY_HINT = [
   'You are replying to an end user inside a chat bot.',
   'Answer the user request directly, naturally, and helpfully.',
@@ -829,7 +829,7 @@ function executeGeminiCLI(prompt, timeout, resumeLatest, model) {
   return new Promise((resolve) => {
     const startTime = Date.now();
     const modelName = model || 'gemini-2.5-flash';
-    console.log(`[Gemini CLI] 执行 [${modelName}]: "${prompt.slice(0, 50)}..."${resumeLatest ? ' [resume:latest]' : ''}`);
+    console.log(`[Gemini CLI] Executing [${modelName}]: "${prompt.slice(0, 50)}..."${resumeLatest ? ' [resume:latest]' : ''}`);
     const wrappedPrompt = buildGeminiPrompt(prompt);
 
     const args = [];
@@ -861,7 +861,7 @@ function executeGeminiCLI(prompt, timeout, resumeLatest, model) {
     child.on('close', (code) => {
       clearTimeout(timer);
       const duration = Date.now() - startTime;
-      // 从 json 输出提取 session_id 和 response
+      // Extract session_id and response from JSON output
       let capturedSessionId = null;
       let responseText = stdout.trim();
       try {
@@ -870,7 +870,7 @@ function executeGeminiCLI(prompt, timeout, resumeLatest, model) {
         responseText = json.response || responseText;
       } catch {}
       responseText = sanitizeGeminiResponse(responseText);
-      console.log(`[Gemini CLI] 完成，耗时 ${duration}ms，输出 ${responseText.length} 字节${capturedSessionId ? '，session:' + capturedSessionId.slice(0, 8) : ''}`);
+      console.log(`[Gemini CLI] Done, took ${duration}ms, output ${responseText.length} bytes${capturedSessionId ? ', session:' + capturedSessionId.slice(0, 8) : ''}`);
       resolve({
         stdout: responseText, stderr: stderr.trim(),
         exitCode: code || 0, error: code ? `Exit code ${code}` : null, duration,
@@ -888,10 +888,10 @@ function executeGeminiCLI(prompt, timeout, resumeLatest, model) {
   });
 }
 
-// ========== CLI 回退执行（原有逻辑） ==========
-const CLAUDE_PATH = '/opt/homebrew/bin/claude';
-const CODEX_PATH = '/opt/homebrew/bin/codex';
-const GEMINI_PATH = '/opt/homebrew/bin/gemini';
+// ========== CLI fallback execution (legacy path) ==========
+const CLAUDE_PATH = process.env.CLAUDE_PATH || 'claude';
+const CODEX_PATH = process.env.CODEX_PATH || 'codex';
+const GEMINI_PATH = process.env.GEMINI_PATH || 'gemini';
 const CC_LOG = '/tmp/cc-live.log';
 
 function buildCliEnv(extra = {}) {
@@ -907,7 +907,7 @@ function executeClaudeCLI(prompt, timeout, sessionId, model) {
   return new Promise((resolve) => {
     const startTime = Date.now();
     const useModel = model || 'claude-opus-4-6';
-    console.log(`[Claude CLI] 执行 [${useModel}]: "${prompt.slice(0, 50)}..."${sessionId ? ' [会话:' + sessionId.slice(0, 8) + ']' : ''}`);
+    console.log(`[Claude CLI] Executing [${useModel}]: "${prompt.slice(0, 50)}..."${sessionId ? ' [session:' + sessionId.slice(0, 8) + ']' : ''}`);
 
     const args = ['--print', '--model', useModel];
     if (sessionId) {
@@ -919,10 +919,10 @@ function executeClaudeCLI(prompt, timeout, sessionId, model) {
       }
     }
     args.push('--dangerously-skip-permissions', prompt);
-    console.log(`[Claude CLI] 命令: ${CLAUDE_PATH} ${args.map(v => JSON.stringify(v)).join(' ')}`);
+    console.log(`[Claude CLI] Command: ${CLAUDE_PATH} ${args.map(v => JSON.stringify(v)).join(' ')}`);
 
-    // 写入实时日志
-    try { fs.appendFileSync(CC_LOG, `\n${'='.repeat(60)}\n[${new Date().toISOString()}] CC 开始: ${prompt.slice(0, 80)}...\n${'='.repeat(60)}\n`); } catch (e) {}
+    // Write to live log
+    try { fs.appendFileSync(CC_LOG, `\n${'='.repeat(60)}\n[${new Date().toISOString()}] CC started: ${prompt.slice(0, 80)}...\n${'='.repeat(60)}\n`); } catch (e) {}
     const child = spawn(CLAUDE_PATH, args, {
       cwd: process.env.HOME,
       env: buildCliEnv({ TERM: 'xterm-256color' }),
@@ -957,15 +957,15 @@ function executeClaudeCLI(prompt, timeout, sessionId, model) {
     child.on('close', (code) => {
       clearTimeout(timer);
       const duration = Date.now() - startTime;
-      console.log(`[Claude CLI] 完成，耗时 ${duration}ms，输出 ${stdout.length} 字节`);
+      console.log(`[Claude CLI] Done, took ${duration}ms, output ${stdout.length} bytes`);
 
-      try { fs.appendFileSync(CC_LOG, `\n[${new Date().toISOString()}] CC 结束 (${duration}ms, exit ${code})\n`); } catch (e) {}
+      try { fs.appendFileSync(CC_LOG, `\n[${new Date().toISOString()}] CC finished (${duration}ms, exit ${code})\n`); } catch (e) {}
 
       const screenshotMatch = stdout.match(/PLEASE_UPLOAD_TO_DISCORD:\s*(.+\.png)/);
       const screenshotPath = screenshotMatch ? screenshotMatch[1].trim() : null;
 
       if (screenshotPath) {
-        console.log(`[Claude CLI] 检测到截图: ${screenshotPath}`);
+        console.log(`[Claude CLI] Screenshot detected: ${screenshotPath}`);
       }
 
       let ccSessionId = sessionId || null;
@@ -1007,7 +1007,7 @@ function executeClaudeCLI(prompt, timeout, sessionId, model) {
   });
 }
 
-// ========== 完成通知（最终结果推回 bot 侧 callback channel） ==========
+// ========== Completion notification (push final result back to bot-side callback channel) ==========
 const CLI_TASK_TYPES = new Set(['claude-cli', 'codex-cli', 'gemini-cli']);
 const CLI_LABELS = { 'claude-cli': 'CC', 'codex-cli': 'Codex', 'gemini-cli': 'Gemini' };
 
@@ -1033,7 +1033,7 @@ function reportTaskEvent(task, type, details = {}) {
       entrypoint: task.entrypoint || null,
     },
   }).catch((err) => {
-    console.error(`[事件] ${type} 上报失败: ${err.message}`);
+    console.error(`[Event] ${type} report failed: ${err.message}`);
   });
 }
 
@@ -1042,11 +1042,11 @@ function notifyCompletion(task, result) {
   if (task.responseMode && task.responseMode !== 'direct-callback') return;
 
   const label = CLI_LABELS[task.type] || task.type;
-  const output = (result.stdout || '').slice(-1800) || '(无输出)';
+  const output = (result.stdout || '').slice(-1800) || '(no output)';
 
   if (result.exitCode !== 0) {
-    const duration = result.duration ? `${Math.round(result.duration / 1000)}s` : '未知';
-    notifyDiscord(task.callbackChannel, task.sessionId, output, `❌ ${label} 失败（${duration}）`, task.callbackBotToken);
+    const duration = result.duration ? `${Math.round(result.duration / 1000)}s` : 'unknown';
+    notifyDiscord(task.callbackChannel, task.sessionId, output, `❌ ${label} failed (${duration})`, task.callbackBotToken);
     reportTaskEvent(task, 'callback.dispatched', {
       channel: task.callbackChannel,
       outcome: 'failure-message',
@@ -1062,17 +1062,17 @@ function notifyCompletion(task, result) {
       const backoff = Math.min(attempt * 3000, 15000);
       discordPost(task.callbackChannel, message, task.callbackBotToken).then(({ status }) => {
         if (status >= 200 && status < 300) {
-          console.log(`[回调] ${label} 输出已推送 ${describeTaskMode(task)}${attempt > 1 ? ` [第${attempt}次]` : ''}`);
+          console.log(`[Callback] ${label} output pushed ${describeTaskMode(task)}${attempt > 1 ? ` [attempt #${attempt}]` : ''}`);
           reportTaskEvent(task, 'callback.sent', {
             channel: task.callbackChannel,
             attempts: attempt,
             status,
           });
         } else if (attempt < maxRetries) {
-          console.error(`[回调] 推送失败 (${status})，${backoff/1000}s 后重试`);
+          console.error(`[Callback] Push failed (${status}), retrying in ${backoff/1000}s`);
           setTimeout(trySend, backoff);
         } else {
-          console.error(`[回调] ${label} ${maxRetries}次推送均失败 (${status})`);
+          console.error(`[Callback] ${label} all ${maxRetries} push attempts failed (${status})`);
           reportTaskEvent(task, 'callback.failed', {
             channel: task.callbackChannel,
             attempts: attempt,
@@ -1081,10 +1081,10 @@ function notifyCompletion(task, result) {
         }
       }).catch(err => {
         if (attempt < maxRetries) {
-          console.error(`[回调] 推送错误，${backoff/1000}s 后重试: ${err.message}`);
+          console.error(`[Callback] Push error, retrying in ${backoff/1000}s: ${err.message}`);
           setTimeout(trySend, backoff);
         } else {
-          console.error(`[回调] ${label} ${maxRetries}次推送均失败: ${err.message}`);
+          console.error(`[Callback] ${label} all ${maxRetries} push attempts failed: ${err.message}`);
           reportTaskEvent(task, 'callback.failed', {
             channel: task.callbackChannel,
             attempts: attempt,
@@ -1098,7 +1098,7 @@ function notifyCompletion(task, result) {
   }
 }
 
-// ========== 并发任务管理 ==========
+// ========== Concurrent task management ==========
 let isRunning = true;
 let consecutiveErrors = 0;
 const runningTasks = new Set();
@@ -1110,20 +1110,20 @@ async function executeTask(task) {
     let result;
 
     if (task.type === 'file-write') {
-      console.log(`[${runningTasks.size}/${CONFIG.maxConcurrent}] [文件写入] ${taskId}... - ${task.path.trim()}`);
+      console.log(`[${runningTasks.size}/${CONFIG.maxConcurrent}] [File write] ${taskId}... - ${task.path.trim()}`);
       result = await writeFileToDisk(task.path, task.content, task.encoding);
     } else if (task.type === 'file-read') {
-      console.log(`[${runningTasks.size}/${CONFIG.maxConcurrent}] [文件读取] ${taskId}... - ${task.path}`);
+      console.log(`[${runningTasks.size}/${CONFIG.maxConcurrent}] [File read] ${taskId}... - ${task.path}`);
       result = await readFileFromDisk(task.path);
     } else if (task.type === 'file-edit') {
-      console.log(`[${runningTasks.size}/${CONFIG.maxConcurrent}] [文件编辑] ${taskId}... - ${task.path}`);
+      console.log(`[${runningTasks.size}/${CONFIG.maxConcurrent}] [File edit] ${taskId}... - ${task.path}`);
       result = await editFileOnDisk(task.path, task.oldString, task.newString, task.replaceAll);
     } else if (task.type === 'claude-cli') {
-      // 短 ID 前缀解析（/cc-recent 显示 8 位，用户照抄后需要还原完整 UUID）
+      // Short ID prefix resolution (/cc-recent shows 8-char IDs, need to resolve to full UUID)
       if (task.sessionId) task.sessionId = resolveSessionPrefix(task.sessionId);
       console.log(`[${runningTasks.size}/${CONFIG.maxConcurrent}] [Claude ${sdkQuery ? 'SDK' : 'CLI'}] ${taskId} ${describeTaskMode(task)} - ${task.prompt?.slice(0, 50)}...`);
-      // ack 已由 cc-bridge registerCommand 处理，worker 不再重复推
-      // CC 模型 fallback：Opus → Sonnet → 不指定（用 CC 默认）
+      // Ack already handled by cc-bridge registerCommand, worker doesn't push again
+      // CC model fallback: Opus → Sonnet (uses CC default if unspecified)
       const CC_MODELS = ['claude-opus-4-6', 'claude-sonnet-4-6'];
       for (let i = 0; i < CC_MODELS.length; i++) {
         const model = CC_MODELS[i];
@@ -1133,11 +1133,11 @@ async function executeTask(task) {
           } else {
             result = await executeClaudeCLI(task.prompt, task.timeout, task.sessionId, model);
           }
-          // 成功或正常退出（exitCode 非 0 也算完成，不重试）
+          // Success or normal exit (non-zero exitCode counts as complete, no retry)
           break;
         } catch (err) {
           const isLast = i === CC_MODELS.length - 1;
-          console.warn(`[CC Fallback] ${model} 失败: ${err.message}${isLast ? '' : '，降级 ' + CC_MODELS[i + 1]}`);
+          console.warn(`[CC Fallback] ${model} failed: ${err.message}${isLast ? '' : ', falling back to ' + CC_MODELS[i + 1]}`);
           if (isLast) throw err;
         }
       }
@@ -1148,7 +1148,7 @@ async function executeTask(task) {
       console.log(`[${runningTasks.size}/${CONFIG.maxConcurrent}] [Gemini CLI] ${taskId} ${describeTaskMode(task)}${task.resumeLatest ? ' [resume:latest]' : ''}${task.model ? ' [' + task.model + ']' : ''} - ${task.prompt?.slice(0, 50)}...`);
       result = await executeGeminiCLI(task.prompt, task.timeout, task.resumeLatest, task.model);
     } else {
-      console.log(`[${runningTasks.size}/${CONFIG.maxConcurrent}] [命令] ${taskId}... - ${task.command}`);
+      console.log(`[${runningTasks.size}/${CONFIG.maxConcurrent}] [Command] ${taskId}... - ${task.command}`);
       result = await executeCommand(task.command, task.timeout);
     }
 
@@ -1156,20 +1156,20 @@ async function executeTask(task) {
       rememberMappedSession(task.sessionId, result.metadata.sessionId, task.callbackChannel);
     }
 
-    // 上报结果
+    // Report result
     await request('POST', '/worker/result', {
       taskId: task.id,
       ...result
     });
 
-    // CC 任务完成后回调通知 bot 侧 channel
+    // Callback notification to bot-side channel after CC task completes
     notifyCompletion(task, result);
 
     const status = result.exitCode === 0 ? '✓' : '✗';
-    console.log(`[完成] ${status} ${taskId}... (剩余: ${runningTasks.size - 1})`);
+    console.log(`[Done] ${status} ${taskId}... (remaining: ${runningTasks.size - 1})`);
 
   } catch (err) {
-    console.error(`[错误] ${taskId}... - ${err.message}`);
+    console.error(`[Error] ${taskId}... - ${err.message}`);
     try {
       await request('POST', '/worker/result', {
         taskId: task.id,
@@ -1179,14 +1179,14 @@ async function executeTask(task) {
         error: err.message
       });
     } catch (reportErr) {
-      console.error(`[上报失败] ${taskId}... - ${reportErr.message}`);
+      console.error(`[Report failed] ${taskId}... - ${reportErr.message}`);
     }
   } finally {
     runningTasks.delete(task.id);
   }
 }
 
-// 主调和循环：hook 优先，长轮询负责领取任务和兜底恢复
+// Main reconciler loop: hooks take priority, long-poll claims tasks and provides fallback recovery
 async function runReconcilerLoop() {
   while (isRunning) {
     try {
@@ -1198,7 +1198,7 @@ async function runReconcilerLoop() {
       const pollRes = await request('GET', `/worker/poll?wait=${CONFIG.longPollWait}`);
 
       if (pollRes.status === 401) {
-        console.error('[错误] Token 认证失败，请检查配置');
+        console.error('[Error] Token authentication failed, check configuration');
         await sleep(10000);
         continue;
       }
@@ -1218,9 +1218,9 @@ async function runReconcilerLoop() {
       const waitTime = Math.min(consecutiveErrors * 5000, 60000);
 
       if (consecutiveErrors === 1) {
-        console.error(`[连接失败] ${err.message}`);
+        console.error(`[Connection failed] ${err.message}`);
       }
-      console.log(`[重试] ${waitTime / 1000}s 后重试... (第 ${consecutiveErrors} 次)`);
+      console.log(`[Retry] Retrying in ${waitTime / 1000}s... (attempt #${consecutiveErrors})`);
 
       await sleep(waitTime);
     }
@@ -1231,7 +1231,7 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// ========== 导出活跃会话列表（供外部查询） ==========
+// ========== Export active sessions (for external queries) ==========
 export function getActiveSessions() {
   return Array.from(liveSessions.entries()).map(([sessionId, s]) => ({
     sessionId,
@@ -1240,20 +1240,20 @@ export function getActiveSessions() {
   }));
 }
 
-// ========== 优雅退出 ==========
+// ========== Graceful shutdown ==========
 process.on('SIGINT', () => {
-  console.log('\n[退出] 收到 Ctrl+C，正在停止...');
+  console.log('\n[Shutdown] Received Ctrl+C, stopping...');
   isRunning = false;
   saveSessions();
   setTimeout(() => process.exit(0), 1000);
 });
 
 process.on('SIGTERM', () => {
-  console.log('\n[退出] 收到终止信号，正在停止...');
+  console.log('\n[Shutdown] Received SIGTERM, stopping...');
   isRunning = false;
   saveSessions();
   setTimeout(() => process.exit(0), 1000);
 });
 
-// ========== 启动 ==========
+// ========== Start ==========
 runReconcilerLoop().catch(console.error);

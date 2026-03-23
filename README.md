@@ -2,11 +2,9 @@
 
 # openclaw-tunnel
 
-**Bridge Docker OpenClaw to Host CLIs**
+**Run AI Coding Agents from Anywhere — Docker, Cloud, or Hybrid**
 
-*Run Claude Code, Codex, and Gemini from your chat app — even when OpenClaw is in Docker and your CLIs are on the host.*
-
-An HTTP task-queue bridge that lets OpenClaw (inside Docker) dispatch tasks to Claude Code, Codex, and Gemini CLI on the host, with per-channel session continuity and zero-token relay.
+*An HTTP task-queue bridge that lets OpenClaw dispatch tasks to Claude Code, Codex, and Gemini CLI across container boundaries, network boundaries, or both.*
 
 [![MIT License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Node.js](https://img.shields.io/badge/Node.js-≥22.5-339933?logo=node.js)](https://nodejs.org)
@@ -18,47 +16,96 @@ An HTTP task-queue bridge that lets OpenClaw (inside Docker) dispatch tasks to C
 
 ---
 
-## acpx vs tunnel
+## Why tunnel?
 
 [acpx](https://github.com/openclaw/acpx) is the official OpenClaw CLI client built on the [Agent Client Protocol](https://agentclientprotocol.com/) (ACP). It spawns the CLI as a local child process over stdio. If OpenClaw and Claude Code are on the same machine, acpx is the right choice.
 
-**The problem:** when OpenClaw runs in Docker, acpx cannot reach a CLI on the host. ACP is a stdio protocol with no network transport. Remote ACP is still "work in progress" in the spec.
+**The problem:** when OpenClaw runs in Docker or on a remote server, acpx cannot reach a CLI on another machine. ACP is a stdio protocol with no network transport. Remote ACP is still "work in progress" in the spec.
 
-**What tunnel does:** instead of waiting for remote ACP, tunnel bridges the gap with an HTTP task queue. The plugin (inside Docker) enqueues tasks to `task-api`. A runner on the host long-polls for tasks, spawns the CLI, and posts results back to your chat channel via callback.
+**What tunnel does:** instead of waiting for remote ACP, tunnel bridges the gap with an HTTP task queue. The plugin (inside Docker) enqueues tasks to `task-api`. A runner anywhere on the network long-polls for tasks, spawns the CLI, and posts results back to your chat channel via callback.
 
 | | acpx | tunnel |
 |---|---|---|
 | Protocol | ACP (JSON-RPC over stdio) | HTTP task queue + callback |
-| Requires same machine | Yes | No — Docker + host |
+| Same machine required | Yes | No — works across networks |
 | Session model | By git directory | By chat channel |
 | Token cost | Zero (protocol layer) | Zero (protocol layer) |
-| Best for | OpenClaw on host | OpenClaw in Docker |
+| Best for | OpenClaw on bare metal | OpenClaw in Docker or cloud |
 
 ---
 
-## Architecture
+## Deployment Scenarios
+
+tunnel supports three deployment patterns. Pick the one that fits your setup:
+
+### Scenario A: Local Docker *(default)*
+
+OpenClaw + task-api in Docker on your machine. Runner on the host. Everything on one box.
 
 ```
-┌─────────────────────────────────┐
-│  Docker                         │
-│  ┌───────────┐  ┌────────────┐  │
-│  │ OpenClaw  │  │  task-api  │  │
-│  │  + plugin │──│  :3456     │  │
-│  └───────────┘  └─────┬──────┘  │
-└───────────────────────┼─────────┘
-                        │ long-poll
-┌───────────────────────┼─────────┐
-│  Host                 │         │
-│              ┌────────┴───────┐ │
-│              │  runner        │ │
-│              │  → Claude Code │ │
-│              │  → Codex       │ │
-│              │  → Gemini      │ │
-│              └────────────────┘ │
-└─────────────────────────────────┘
+┌──────────────────────────────────────┐
+│  Your Machine                        │
+│                                      │
+│  ┌─────────── Docker ──────────────┐ │
+│  │  OpenClaw + plugin              │ │
+│  │  task-api :3456                 │ │
+│  └──────────────┬──────────────────┘ │
+│                 │ long-poll           │
+│  ┌──────────────┴──────────────────┐ │
+│  │  runner                         │ │
+│  │  → Claude Code / Codex / Gemini │ │
+│  └─────────────────────────────────┘ │
+└──────────────────────────────────────┘
 ```
 
-The plugin submits tasks to `task-api` (Docker). The runner on the host long-polls for pending tasks, spawns the requested CLI, and posts results back to your chat channel via bot callback.
+```bash
+# Runner connects to localhost (default)
+WORKER_URL=http://localhost:3456
+```
+
+### Scenario B: Cloud + Local Runner
+
+task-api on a cloud VM (AWS, GCP, any VPS). Runner on your local machine — your CLIs stay local, but orchestration lives in the cloud.
+
+```
+┌───── Cloud VM ──────┐           ┌────── Your Machine ──────┐
+│  Docker             │           │                           │
+│   OpenClaw + plugin │ internet  │  runner                   │
+│   task-api :3456    │◄──────────│  → Claude Code            │
+│                     │           │  → Codex                  │
+└─────────────────────┘           │  → Gemini                 │
+                                  └───────────────────────────┘
+```
+
+```bash
+# Runner connects to cloud server
+WORKER_URL=http://your-server.com:3456
+```
+
+### Scenario C: Fully Remote
+
+Everything on cloud infrastructure. Ideal for compliance requirements — all AI agent execution contained within managed servers.
+
+```
+┌────────────────── Cloud VM ──────────────────┐
+│                                              │
+│  ┌─────────── Docker ──────────────┐         │
+│  │  OpenClaw + plugin              │         │
+│  │  task-api :3456                 │         │
+│  └──────────────┬──────────────────┘         │
+│                 │ long-poll (localhost)       │
+│  ┌──────────────┴──────────────────┐         │
+│  │  runner                         │         │
+│  │  → Claude Code / Codex / Gemini │         │
+│  └─────────────────────────────────┘         │
+└──────────────────────────────────────────────┘
+```
+
+```bash
+# Runner and task-api on the same VM
+WORKER_URL=http://localhost:3456
+# Install CLIs on the VM, run the runner as a systemd service
+```
 
 ---
 
@@ -72,6 +119,8 @@ The plugin submits tasks to `task-api` (Docker). The runner on the host long-pol
 | **Platform agnostic** | Discord, Telegram, or any platform OpenClaw supports |
 | **One-command setup** | `setup.sh` generates `.env`, updates plugin config, installs LaunchAgent |
 | **Concurrent execution** | Up to 5 parallel tasks with automatic model fallback |
+| **SDK + CLI modes** | Agent SDK (streaming) with automatic fallback to CLI |
+| **Cloud-ready** | Deploy anywhere — local Docker, cloud VM, or hybrid |
 
 ---
 
@@ -100,7 +149,7 @@ After setup, copy `plugin/` into your OpenClaw plugins folder (or reference it i
 
 **`task-api/`** — Express HTTP server in Docker. Accepts tasks from the plugin, stores them in SQLite, serves them to the runner via long-polling, and posts results back to your chat via bot callback. Default port 3456.
 
-**`runner/`** — Node.js worker on the host. Long-polls `task-api`, spawns Claude Code / Codex / Gemini CLI as child processes (up to 5 concurrent), and reports results back. Prefers `claude-opus-4-6`, auto-fallback to `claude-sonnet-4-6`.
+**`runner/`** — Node.js worker on the host (or any machine). Long-polls `task-api`, spawns Claude Code / Codex / Gemini CLI as child processes (up to 5 concurrent), and reports results back. Prefers Agent SDK with streaming, auto-fallback to CLI mode.
 
 **`plugin/`** — OpenClaw plugin (TypeScript). Registers `/cc`, `/codex`, `/gemini` command families, manages per-channel session bindings in SQLite, and submits tasks to `task-api`.
 
@@ -132,27 +181,29 @@ Copy `.env.example` to `.env` (or let `setup.sh` generate it):
 | `CALLBACK_API_BASE_URL` | task-api | Bot API base URL (default: Discord) |
 | `WORKER_URL` | runner | URL to reach task-api (default: `http://localhost:3456`) |
 | `CLAUDE_PATH` | runner | Path to `claude` binary (default: `claude`) |
+| `CODEX_PATH` | runner | Path to `codex` binary (default: `codex`) |
+| `GEMINI_PATH` | runner | Path to `gemini` binary (default: `gemini`) |
 | `CC_TIMEOUT` | runner | Max execution time per task in ms (default: `1200000`) |
 | `MAX_CONCURRENT` | runner | Max parallel tasks (default: `5`) |
 | `POLL_INTERVAL` | runner | Polling interval when at capacity (default: `500` ms) |
 | `LONG_POLL_WAIT` | runner | Long-poll wait window (default: `30000` ms) |
-| `DISCORD_PROXY` | runner | HTTPS proxy for users behind firewalls |
+| `DISCORD_PROXY` | runner | HTTPS proxy for callback delivery (optional) |
 
 The plugin reads `apiUrl`, `apiToken`, and `callbackChannel` from `plugin/openclaw.plugin.json` — `setup.sh` populates these automatically.
 
 </details>
 
 <details>
-<summary><strong>Runner on Linux</strong></summary>
+<summary><strong>Runner on Linux / Cloud</strong></summary>
 
-`setup.sh` installs a macOS LaunchAgent automatically. On Linux, run the runner manually:
+`setup.sh` installs a macOS LaunchAgent automatically. On Linux or cloud VMs, run the runner manually:
 
 ```bash
 cd runner
 WORKER_URL=http://localhost:3456 WORKER_TOKEN=your-token node worker.js
 ```
 
-Or register as a systemd service:
+Or register as a systemd service for always-on operation:
 
 ```ini
 [Unit]
@@ -169,12 +220,14 @@ Restart=always
 WantedBy=multi-user.target
 ```
 
+For cloud deployment (Scenario B), replace `localhost` with the cloud server's IP or domain.
+
 </details>
 
 <details>
 <summary><strong>Why long-polling?</strong></summary>
 
-The runner sits on the host behind NAT — `task-api` inside Docker cannot push to it. Rather than requiring the runner to expose a port or set up a reverse tunnel, the runner holds an open HTTP connection to `task-api` waiting for work. When a task arrives, `task-api` responds immediately. No inbound firewall rules, no WebSocket server, and the runner works identically on macOS, Linux, or a remote machine.
+The runner sits on the host (or a remote machine) behind NAT — `task-api` inside Docker cannot push to it. Rather than requiring the runner to expose a port or set up a reverse tunnel, the runner holds an open HTTP connection to `task-api` waiting for work. When a task arrives, `task-api` responds immediately. No inbound firewall rules, no WebSocket server, and the runner works identically on macOS, Linux, localhost, or across the internet.
 
 </details>
 
@@ -183,7 +236,7 @@ The runner sits on the host behind NAT — `task-api` inside Docker cannot push 
 
 - Docker (with Docker Compose)
 - Node.js >= 22.5 (required for `node:sqlite` built-in)
-- Claude Code CLI installed and authenticated on the host
+- At least one CLI installed and authenticated: Claude Code, Codex, or Gemini
 - OpenClaw instance (Docker deployment)
 
 </details>
@@ -192,7 +245,7 @@ The runner sits on the host behind NAT — `task-api` inside Docker cannot push 
 
 ## Author
 
-Built by [AliceLJY](https://github.com/AliceLJY) — a non-programmer who builds AI agent infrastructure with Claude Code. Writes about the journey at WeChat public account "我的AI小木屋" (My AI Cabin).
+Built by [AliceLJY](https://github.com/AliceLJY) — a non-programmer who builds AI agent infrastructure with Claude Code. Writes about the journey on WeChat: "My AI Cabin".
 
 This project grew out of real-world pain: running five OpenClaw bots in Docker while needing Claude Code, Codex, and Gemini on the host.
 
