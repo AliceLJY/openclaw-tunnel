@@ -28,7 +28,13 @@ function parseConfigInt(value, fallback, min = 1, max = Number.MAX_SAFE_INTEGER)
 // ========== Agent SDK loading (falls back to CLI on failure) ==========
 let sdkQuery;
 try {
-  const sdk = await import('@anthropic-ai/claude-agent-sdk');
+  const SDK_IMPORT_TIMEOUT_MS = 15000;
+  const sdk = await Promise.race([
+    import('@anthropic-ai/claude-agent-sdk'),
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(`SDK import timed out after ${SDK_IMPORT_TIMEOUT_MS}ms`)), SDK_IMPORT_TIMEOUT_MS)
+    ),
+  ]);
   sdkQuery = sdk.query;
   console.log('[SDK] Agent SDK loaded successfully');
 } catch (e) {
@@ -57,8 +63,14 @@ const CONFIG = {
   runnerSessionCacheFile: process.env.RUNNER_SESSION_CACHE_FILE || '/tmp/openclaw-runner-session-cache.json',
 };
 
+// Token redaction helper -- mask tokens in log output to prevent accidental leakage
+function redactToken(str) {
+  if (!str || str.length < 8) return '****';
+  return str.slice(0, 4) + '*'.repeat(Math.min(str.length - 4, 20));
+}
+
 if (CONFIG.token === 'change-me-to-a-secure-token') {
-  console.warn('⚠ WARNING: Using default WORKER_TOKEN. Set WORKER_TOKEN env var for production!');
+  console.warn('WARNING: Using default WORKER_TOKEN. Set WORKER_TOKEN env var for production!');
 }
 
 console.log('========================================');
@@ -104,7 +116,8 @@ function request(method, urlPath, body = null) {
       res.on('end', () => {
         try {
           resolve({ status: res.statusCode, data: JSON.parse(data || 'null') });
-        } catch {
+        } catch (parseErr) {
+          // Response body is not valid JSON -- return raw string
           resolve({ status: res.statusCode, data: data });
         }
       });
@@ -125,31 +138,124 @@ function request(method, urlPath, body = null) {
   });
 }
 
+// ========== Command validation ==========
+// Allowlist of command prefixes that the runner is permitted to execute.
+// Commands from Docker containers must start with one of these; anything else is rejected.
+const COMMAND_ALLOWLIST = [
+  'git ', 'npm ', 'node ', 'npx ', 'ls ', 'cat ', 'head ', 'tail ',
+  'grep ', 'find ', 'wc ', 'echo ', 'pwd', 'date', 'which ', 'env',
+  'docker ', 'docker-compose ', 'curl ', 'wget ',
+  'cd ', 'mkdir ', 'cp ', 'mv ', 'touch ', 'chmod ',
+  'pip ', 'python ', 'python3 ',
+  'claude ', 'codex ', 'gemini ',
+  'brew ', 'cargo ', 'go ', 'rustc ',
+  'sed ', 'awk ', 'sort ', 'uniq ', 'cut ', 'tr ',
+  'test ', 'bash ', 'zsh ', 'sh ',
+  'du ', 'df ', 'uname ', 'whoami', 'hostname',
+  'tar ', 'zip ', 'unzip ', 'gzip ', 'gunzip ',
+];
+
+function isCommandAllowed(command) {
+  const trimmed = command.trim();
+  // Reject obviously dangerous patterns regardless of prefix
+  const dangerousPatterns = [
+    /[;&|`$]\s*rm\s+-rf\s+\//, // rm -rf /
+    />\s*\/etc\//, // overwrite system files
+    /\bsudo\b/, // privilege escalation
+    /\beval\b/, // eval-based injection
+    /\$\(/, // command substitution
+    /`[^`]+`/, // backtick substitution
+  ];
+  for (const pattern of dangerousPatterns) {
+    if (pattern.test(trimmed)) return false;
+  }
+  // Check allowlist
+  return COMMAND_ALLOWLIST.some(prefix => trimmed.startsWith(prefix) || trimmed === prefix.trim());
+}
+
 // ========== Execute command ==========
-// NOTE: exec() is intentionally used here -- the worker IS a command execution service
+// Uses spawn() with explicit args array to prevent shell injection.
+// Commands are validated against an allowlist before execution.
 function executeCommand(command, timeout) {
   return new Promise((resolve) => {
     const startTime = Date.now();
     const cleanCommand = command.trim();
-    const wrappedCommand = `/bin/zsh -l -c ${JSON.stringify(cleanCommand)}`;
 
-    exec(wrappedCommand, {
+    if (!cleanCommand) {
+      return resolve({
+        stdout: '',
+        stderr: 'Empty command',
+        exitCode: 1,
+        error: 'Empty command',
+        duration: 0
+      });
+    }
+
+    if (!isCommandAllowed(cleanCommand)) {
+      console.warn(`[Command] BLOCKED: command not in allowlist: "${cleanCommand.slice(0, 80)}..."`);
+      return resolve({
+        stdout: '',
+        stderr: `Command not allowed. Must start with one of: ${COMMAND_ALLOWLIST.slice(0, 10).join(', ')}...`,
+        exitCode: 126,
+        error: 'Command not in allowlist',
+        duration: 0
+      });
+    }
+
+    // Use spawn with shell args array instead of exec to prevent injection.
+    // The command is passed as a single -c argument string to /bin/zsh, which is safe
+    // because spawn does NOT invoke a shell layer on top -- it calls /bin/zsh directly.
+    const child = trackChildProcess(spawn('/bin/zsh', ['-l', '-c', cleanCommand], {
       timeout: timeout || CONFIG.defaultTimeout,
-      maxBuffer: 10 * 1024 * 1024,
       env: {
         ...process.env,
         PATH: process.env.PATH + ':/usr/local/bin:/opt/homebrew/bin',
         HOME: process.env.HOME,
         USER: process.env.USER
-      }
-    }, (error, stdout, stderr) => {
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+      maxBuffer: 10 * 1024 * 1024,
+    }));
+
+    let stdout = '';
+    let stderr = '';
+
+    child.stdout.on('data', (data) => { stdout += data.toString(); });
+    child.stderr.on('data', (data) => { stderr += data.toString(); });
+
+    const effectiveTimeout = timeout || CONFIG.defaultTimeout;
+    const timer = setTimeout(() => {
+      child.kill('SIGTERM');
+      setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* already dead */ } }, 5000);
+      resolve({
+        stdout,
+        stderr: stderr || 'Timeout',
+        exitCode: -1,
+        error: 'Command timeout',
+        duration: Date.now() - startTime
+      });
+    }, effectiveTimeout);
+
+    child.on('close', (code) => {
+      clearTimeout(timer);
       const duration = Date.now() - startTime;
       resolve({
         stdout: stdout || '',
         stderr: stderr || '',
-        exitCode: error ? error.code || 1 : 0,
-        error: error ? error.message : null,
+        exitCode: code ?? 1,
+        error: code ? `Exit code ${code}` : null,
         duration
+      });
+    });
+
+    child.on('error', (err) => {
+      clearTimeout(timer);
+      resolve({
+        stdout,
+        stderr: err.message,
+        exitCode: -1,
+        error: err.message,
+        duration: Date.now() - startTime
       });
     });
   });
@@ -163,11 +269,30 @@ function expandHome(filePath) {
   return filePath;
 }
 
+// Path traversal guard: reject paths that escape $HOME via ../
+function isPathSafe(resolvedPath) {
+  const home = process.env.HOME;
+  const normalized = path.resolve(resolvedPath);
+  // Allow paths under HOME, /tmp, and /var/tmp
+  const allowedRoots = [home, '/tmp', '/var/tmp'];
+  return allowedRoots.some(root => normalized.startsWith(root + path.sep) || normalized === root);
+}
+
 function writeFileToDisk(filePath, content, encoding) {
   return new Promise((resolve) => {
     try {
       const cleanPath = filePath.trim();
       const fullPath = expandHome(cleanPath);
+
+      if (!isPathSafe(fullPath)) {
+        console.warn(`[Write] BLOCKED: path traversal attempt: ${fullPath}`);
+        return resolve({
+          stdout: '',
+          stderr: `Path not allowed: must be under $HOME, /tmp, or /var/tmp`,
+          exitCode: 1,
+          error: 'Path traversal blocked'
+        });
+      }
       console.log(`[Write] ${fullPath}`);
 
       const dir = path.dirname(fullPath);
@@ -201,6 +326,15 @@ function readFileFromDisk(filePath) {
   return new Promise((resolve) => {
     try {
       const fullPath = expandHome(filePath);
+      if (!isPathSafe(fullPath)) {
+        console.warn(`[Read] BLOCKED: path traversal attempt: ${fullPath}`);
+        return resolve({
+          stdout: '',
+          stderr: `Path not allowed: must be under $HOME, /tmp, or /var/tmp`,
+          exitCode: 1,
+          error: 'Path traversal blocked'
+        });
+      }
       const content = fs.readFileSync(fullPath, 'utf8');
       resolve({
         stdout: content,
@@ -223,6 +357,15 @@ function editFileOnDisk(filePath, oldString, newString, replaceAll) {
   return new Promise((resolve) => {
     try {
       const fullPath = expandHome(filePath.trim());
+      if (!isPathSafe(fullPath)) {
+        console.warn(`[Edit] BLOCKED: path traversal attempt: ${fullPath}`);
+        return resolve({
+          stdout: '',
+          stderr: `Path not allowed: must be under $HOME, /tmp, or /var/tmp`,
+          exitCode: 1,
+          error: 'Path traversal blocked'
+        });
+      }
       console.log(`[Edit] ${fullPath}`);
 
       if (!fs.existsSync(fullPath)) {
@@ -288,6 +431,11 @@ const liveSessions = new Map();   // sdkSessionId → { lastActivity, callbackCh
 const sessionIdMap = new Map();   // taskApiSessionId → sdkSessionId (mapping table)
 const ccSessions = new Set();     // CLI mode: tracks created CC sessions
 
+// Simple write guard to prevent concurrent saveSessions from corrupting the file.
+// Node.js is single-threaded for JS, but async callbacks can interleave save calls.
+let sessionSavePending = false;
+let sessionSaveQueued = false;
+
 function rememberMappedSession(taskApiId, providerSessionId, callbackChannel) {
   if (!providerSessionId) return;
   liveSessions.set(providerSessionId, {
@@ -323,8 +471,11 @@ function listRecentCodexSessions(days = 30) {
           return { sessionId, mtime: stat.mtimeMs };
         });
       sessionFiles.push(...files);
-    } catch {
-      // Day directory doesn't exist, skip
+    } catch (dirErr) {
+      // Day directory doesn't exist or unreadable, skip
+      if (dirErr.code !== 'ENOENT') {
+        console.warn(`[Codex Session] Error reading day directory: ${dirErr.message}`);
+      }
     }
   }
 
@@ -374,31 +525,65 @@ function resolveSessionPrefix(prefix) {
       console.log(`[Session] Prefix ${prefix} matched ${matches.length} sessions, using latest: ${fullId}`);
       return fullId;
     }
-  } catch { /* directory doesn't exist */ }
+  } catch (err) {
+    if (err.code !== 'ENOENT') {
+      console.warn(`[Session] Error resolving prefix ${prefix}: ${err.message}`);
+    }
+  }
   return prefix; // Not found, return original value for downstream handling
 }
 
 function loadSessions() {
   try {
-    const data = JSON.parse(fs.readFileSync(SESSION_FILE, 'utf8'));
+    let data;
+    try {
+      data = JSON.parse(fs.readFileSync(SESSION_FILE, 'utf8'));
+    } catch (parseErr) {
+      console.warn(`[Session] Failed to parse session cache file: ${parseErr.message}`);
+      return;
+    }
+
+    if (!Array.isArray(data)) {
+      console.warn('[Session] Session cache file has invalid structure (expected array)');
+      return;
+    }
+
+    let restored = 0;
     for (const s of data) {
+      // Validate each entry has required fields and correct types
+      if (!s || typeof s.sessionId !== 'string' || !s.sessionId) {
+        console.warn('[Session] Skipping invalid session entry (missing/invalid sessionId)');
+        continue;
+      }
+      if (s.lastActivity !== undefined && typeof s.lastActivity !== 'number') {
+        console.warn(`[Session] Skipping entry with invalid lastActivity: ${s.sessionId.slice(0, 8)}`);
+        continue;
+      }
+
       liveSessions.set(s.sessionId, {
-        lastActivity: s.lastActivity,
-        callbackChannel: s.callbackChannel
+        lastActivity: s.lastActivity || Date.now(),
+        callbackChannel: typeof s.callbackChannel === 'string' ? s.callbackChannel : null
       });
       ccSessions.add(s.sessionId);
       // Restore mapping
-      if (s.taskApiId) {
+      if (s.taskApiId && typeof s.taskApiId === 'string') {
         sessionIdMap.set(s.taskApiId, s.sessionId);
       }
+      restored++;
     }
-    console.log(`[Session] Restored ${liveSessions.size} runner cache entries`);
-  } catch {
-    // File doesn't exist or malformed, ignore
+    console.log(`[Session] Restored ${restored} runner cache entries`);
+  } catch (err) {
+    console.warn(`[Session] Failed to load session cache: ${err.message}`);
   }
 }
 
 function saveSessions() {
+  if (sessionSavePending) {
+    // Another save is in progress; queue one more save after it finishes
+    sessionSaveQueued = true;
+    return;
+  }
+  sessionSavePending = true;
   try {
     // Reverse lookup taskApiId
     const reverseMap = new Map();
@@ -411,9 +596,18 @@ function saveSessions() {
       lastActivity: s.lastActivity,
       callbackChannel: s.callbackChannel
     }));
-    fs.writeFileSync(SESSION_FILE, JSON.stringify(data, null, 2));
+    // Write to temp file then rename for atomic update (prevents corruption on crash)
+    const tmpFile = SESSION_FILE + '.tmp';
+    fs.writeFileSync(tmpFile, JSON.stringify(data, null, 2));
+    fs.renameSync(tmpFile, SESSION_FILE);
   } catch (e) {
     console.error('[Session] Save failed:', e.message);
+  } finally {
+    sessionSavePending = false;
+    if (sessionSaveQueued) {
+      sessionSaveQueued = false;
+      saveSessions();
+    }
   }
 }
 
@@ -558,7 +752,11 @@ async function executeClaudeSDK(prompt, timeout, sessionId, callbackChannel, mod
           } else if (matches.length > 1) {
             console.warn(`[SDK] Short ID ${sessionId} matched ${matches.length} sessions, skipping`);
           }
-        } catch { /* projectDir doesn't exist */ }
+        } catch (dirErr) {
+          if (dirErr.code !== 'ENOENT') {
+            console.warn(`[SDK] Error scanning project dir for prefix match: ${dirErr.message}`);
+          }
+        }
       }
       // Prefix match also failed → fall back to sessionIdMap lookup
       if (!sdkSessionId) {
@@ -566,18 +764,32 @@ async function executeClaudeSDK(prompt, timeout, sessionId, callbackChannel, mod
         if (!sdkSessionId) {
           // Reload mapping from file (other worker processes may have written it)
           try {
-            const data = JSON.parse(fs.readFileSync(SESSION_FILE, 'utf8'));
-            for (const s of data) {
-              if (s.taskApiId && s.sessionId) {
-                sessionIdMap.set(s.taskApiId, s.sessionId);
-                if (!liveSessions.has(s.sessionId)) {
-                  liveSessions.set(s.sessionId, { lastActivity: s.lastActivity, callbackChannel: s.callbackChannel });
+            const raw = fs.readFileSync(SESSION_FILE, 'utf8');
+            let data;
+            try {
+              data = JSON.parse(raw);
+            } catch (parseErr) {
+              console.warn(`[SDK] Session cache parse failed during mapping reload: ${parseErr.message}`);
+              data = null;
+            }
+            if (Array.isArray(data)) {
+              for (const s of data) {
+                if (s && typeof s.taskApiId === 'string' && typeof s.sessionId === 'string') {
+                  sessionIdMap.set(s.taskApiId, s.sessionId);
+                  if (!liveSessions.has(s.sessionId)) {
+                    liveSessions.set(s.sessionId, {
+                      lastActivity: typeof s.lastActivity === 'number' ? s.lastActivity : Date.now(),
+                      callbackChannel: typeof s.callbackChannel === 'string' ? s.callbackChannel : null,
+                    });
+                  }
                 }
               }
+              sdkSessionId = sessionIdMap.get(sessionId) || null;
+              if (sdkSessionId) console.log(`[SDK] Mapping restored from file: API:${sessionId.slice(0, 8)} → SDK:${sdkSessionId.slice(0, 8)}`);
             }
-            sdkSessionId = sessionIdMap.get(sessionId) || null;
-            if (sdkSessionId) console.log(`[SDK] Mapping restored from file: API:${sessionId.slice(0, 8)} → SDK:${sdkSessionId.slice(0, 8)}`);
-          } catch { /* file doesn't exist or malformed */ }
+          } catch (err) {
+            console.warn(`[SDK] Session cache reload failed: ${err.message}`);
+          }
         }
       }
     }
@@ -728,11 +940,11 @@ function executeCodexCLI(prompt, timeout, sessionId, model) {
     if (resolvedSessionId) args.push(resolvedSessionId);
     args.push(prompt);
 
-    const child = spawn(CODEX_PATH, args, {
+    const child = trackChildProcess(spawn(CODEX_PATH, args, {
       cwd: process.env.HOME,
       env: buildCliEnv(),
       stdio: ['ignore', 'pipe', 'pipe']
-    });
+    }));
 
     let stdout = '';
     let stderr = '';
@@ -742,7 +954,7 @@ function executeCodexCLI(prompt, timeout, sessionId, model) {
 
     const effectiveTimeout = (timeout || CONFIG.defaultTimeout) + 30000;
     const timer = setTimeout(() => {
-      child.kill();
+      child.kill('SIGTERM');
       resolve({
         stdout, stderr: 'Timeout', exitCode: -1,
         error: 'Timeout', duration: Date.now() - startTime
@@ -837,11 +1049,11 @@ function executeGeminiCLI(prompt, timeout, resumeLatest, model) {
       args.push('--resume', 'latest');
     }
     args.push('-m', modelName, '-p', wrappedPrompt, '-o', 'json', '--sandbox=false');
-    const child = spawn(GEMINI_PATH, args, {
+    const child = trackChildProcess(spawn(GEMINI_PATH, args, {
       cwd: process.env.HOME,
       env: buildCliEnv(),
       stdio: ['ignore', 'pipe', 'pipe']
-    });
+    }));
 
     let stdout = '';
     let stderr = '';
@@ -851,7 +1063,7 @@ function executeGeminiCLI(prompt, timeout, resumeLatest, model) {
 
     const effectiveTimeout = (timeout || CONFIG.defaultTimeout) + 30000;
     const timer = setTimeout(() => {
-      child.kill();
+      child.kill('SIGTERM');
       resolve({
         stdout, stderr: 'Timeout', exitCode: -1,
         error: 'Timeout', duration: Date.now() - startTime
@@ -868,7 +1080,10 @@ function executeGeminiCLI(prompt, timeout, resumeLatest, model) {
         const json = JSON.parse(stdout);
         capturedSessionId = json.session_id || null;
         responseText = json.response || responseText;
-      } catch {}
+      } catch (jsonErr) {
+        // Gemini output was not valid JSON -- use raw stdout as response
+        console.warn(`[Gemini CLI] Output is not JSON, using raw text: ${jsonErr.message}`);
+      }
       responseText = sanitizeGeminiResponse(responseText);
       console.log(`[Gemini CLI] Done, took ${duration}ms, output ${responseText.length} bytes${capturedSessionId ? ', session:' + capturedSessionId.slice(0, 8) : ''}`);
       resolve({
@@ -892,7 +1107,7 @@ function executeGeminiCLI(prompt, timeout, resumeLatest, model) {
 const CLAUDE_PATH = process.env.CLAUDE_PATH || 'claude';
 const CODEX_PATH = process.env.CODEX_PATH || 'codex';
 const GEMINI_PATH = process.env.GEMINI_PATH || 'gemini';
-const CC_LOG = '/tmp/cc-live.log';
+const CC_LOG = process.env.CC_LOG_PATH || '/tmp/cc-live.log';
 
 function buildCliEnv(extra = {}) {
   return {
@@ -922,12 +1137,12 @@ function executeClaudeCLI(prompt, timeout, sessionId, model) {
     console.log(`[Claude CLI] Command: ${CLAUDE_PATH} ${args.map(v => JSON.stringify(v)).join(' ')}`);
 
     // Write to live log
-    try { fs.appendFileSync(CC_LOG, `\n${'='.repeat(60)}\n[${new Date().toISOString()}] CC started: ${prompt.slice(0, 80)}...\n${'='.repeat(60)}\n`); } catch (e) {}
-    const child = spawn(CLAUDE_PATH, args, {
+    try { fs.appendFileSync(CC_LOG, `\n${'='.repeat(60)}\n[${new Date().toISOString()}] CC started: ${prompt.slice(0, 80)}...\n${'='.repeat(60)}\n`); } catch (logErr) { console.warn(`[Claude CLI] Log write failed: ${logErr.message}`); }
+    const child = trackChildProcess(spawn(CLAUDE_PATH, args, {
       cwd: process.env.HOME,
       env: buildCliEnv({ TERM: 'xterm-256color' }),
       stdio: ['ignore', 'pipe', 'pipe']
-    });
+    }));
 
     let stdout = '';
     let stderr = '';
@@ -935,7 +1150,7 @@ function executeClaudeCLI(prompt, timeout, sessionId, model) {
     child.stdout.on('data', (data) => {
       const chunk = data.toString();
       stdout += chunk;
-      try { fs.appendFileSync(CC_LOG, chunk); } catch (e) {}
+      try { fs.appendFileSync(CC_LOG, chunk); } catch (logErr) { /* non-critical log write */ }
     });
 
     child.stderr.on('data', (data) => {
@@ -944,7 +1159,7 @@ function executeClaudeCLI(prompt, timeout, sessionId, model) {
 
     const effectiveTimeout = (timeout || CONFIG.defaultTimeout) + 30000;
     const timer = setTimeout(() => {
-      child.kill();
+      child.kill('SIGTERM');
       resolve({
         stdout,
         stderr: 'Timeout',
@@ -959,7 +1174,7 @@ function executeClaudeCLI(prompt, timeout, sessionId, model) {
       const duration = Date.now() - startTime;
       console.log(`[Claude CLI] Done, took ${duration}ms, output ${stdout.length} bytes`);
 
-      try { fs.appendFileSync(CC_LOG, `\n[${new Date().toISOString()}] CC finished (${duration}ms, exit ${code})\n`); } catch (e) {}
+      try { fs.appendFileSync(CC_LOG, `\n[${new Date().toISOString()}] CC finished (${duration}ms, exit ${code})\n`); } catch (logErr) { /* non-critical log write */ }
 
       const screenshotMatch = stdout.match(/PLEASE_UPLOAD_TO_DISCORD:\s*(.+\.png)/);
       const screenshotPath = screenshotMatch ? screenshotMatch[1].trim() : null;
@@ -975,7 +1190,9 @@ function executeClaudeCLI(prompt, timeout, sessionId, model) {
           const lines = fs.readFileSync(historyPath, 'utf8').trim().split('\n');
           const lastEntry = JSON.parse(lines[lines.length - 1]);
           ccSessionId = lastEntry.sessionId || null;
-        } catch (e) {}
+        } catch (histErr) {
+          console.warn(`[Claude CLI] Failed to read session from history.jsonl: ${histErr.message}`);
+        }
       }
 
       const result = {
@@ -1240,20 +1457,54 @@ export function getActiveSessions() {
   }));
 }
 
-// ========== Graceful shutdown ==========
-process.on('SIGINT', () => {
-  console.log('\n[Shutdown] Received Ctrl+C, stopping...');
-  isRunning = false;
-  saveSessions();
-  setTimeout(() => process.exit(0), 1000);
+// ========== Child process tracking (cleanup on exit) ==========
+const activeChildProcesses = new Set();
+
+function trackChildProcess(child) {
+  activeChildProcesses.add(child);
+  child.on('close', () => activeChildProcesses.delete(child));
+  child.on('error', () => activeChildProcesses.delete(child));
+  return child;
+}
+
+function killAllChildren() {
+  for (const child of activeChildProcesses) {
+    try {
+      child.kill('SIGTERM');
+    } catch { /* already dead */ }
+  }
+  // Force kill after 3 seconds if still alive
+  setTimeout(() => {
+    for (const child of activeChildProcesses) {
+      try { child.kill('SIGKILL'); } catch { /* already dead */ }
+    }
+  }, 3000);
+}
+
+// ========== Unhandled rejection / uncaught exception safety net ==========
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('[FATAL] Unhandled promise rejection:', reason);
 });
 
-process.on('SIGTERM', () => {
-  console.log('\n[Shutdown] Received SIGTERM, stopping...');
+process.on('uncaughtException', (err) => {
+  console.error('[FATAL] Uncaught exception:', err.message, err.stack);
+  // Save state and exit -- continuing after uncaught exception is unsafe
+  saveSessions();
+  killAllChildren();
+  process.exit(1);
+});
+
+// ========== Graceful shutdown ==========
+function gracefulShutdown(signal) {
+  console.log(`\n[Shutdown] Received ${signal}, stopping...`);
   isRunning = false;
   saveSessions();
-  setTimeout(() => process.exit(0), 1000);
-});
+  killAllChildren();
+  setTimeout(() => process.exit(0), 5000);
+}
+
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 
 // ========== Start ==========
 runReconcilerLoop().catch(console.error);

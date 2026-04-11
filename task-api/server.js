@@ -171,7 +171,8 @@ function safeParseJson(raw, fallback) {
   if (typeof raw !== 'string' || !raw) return fallback;
   try {
     return JSON.parse(raw);
-  } catch {
+  } catch (parseErr) {
+    // Malformed JSON -- return fallback silently (expected for empty/corrupt data)
     return fallback;
   }
 }
@@ -479,7 +480,8 @@ function countEvents() {
 function getEventDbSizeBytes() {
   try {
     return fs.statSync(EVENT_DB_PATH).size;
-  } catch {
+  } catch (statErr) {
+    // DB file doesn't exist yet
     return 0;
   }
 }
@@ -616,7 +618,7 @@ function listEvents({ limit, taskId, type }) {
     dispatchMode: row.dispatch_mode,
     responseMode: row.response_mode,
     entrypoint: row.entrypoint,
-    details: row.details_json ? JSON.parse(row.details_json) : null,
+    details: row.details_json ? safeParseJson(row.details_json, null) : null,
   }));
 }
 
@@ -730,14 +732,15 @@ async function extractSessionTopic(filePath, fs, readline, resolver) {
           topic = candidate;
           break;
         }
-      } catch {
-        // skip malformed lines
+      } catch (lineErr) {
+        // skip malformed JSONL lines (expected for truncated files)
       }
     }
     rl.close();
     stream.destroy();
-  } catch {
-    // skip unreadable files
+  } catch (readErr) {
+    // skip unreadable files (permission issues, file deleted between readdir and read)
+    console.warn(`[Session] Failed to read session file ${filePath}: ${readErr.message}`);
   }
   return topic || '(no topic)';
 }
@@ -996,13 +999,25 @@ app.post('/worker/event', auth, (req, res) => {
 
 // ========== File I/O API (bypasses shell escaping issues) ==========
 
+// Path traversal guard: reject paths containing .. that could escape safe directories
+function hasPathTraversal(filePath) {
+  if (!filePath) return true;
+  const resolved = path.resolve(filePath);
+  // Block any path that contains '..' traversal after normalization
+  return filePath.includes('..') && resolved !== filePath;
+}
+
 // [Cloud OpenClaw] Write file
 app.post('/files/write', auth, (req, res) => {
-  const { path, content, encoding = 'utf8' } = req.body || {};
-  const normalizedPath = normalizeString(path);
+  const { path: reqPath, content, encoding = 'utf8' } = req.body || {};
+  const normalizedPath = normalizeString(reqPath);
 
   if (!normalizedPath || content === undefined) {
     return res.status(400).json({ error: 'path and content are required' });
+  }
+
+  if (hasPathTraversal(normalizedPath)) {
+    return res.status(400).json({ error: 'Path contains disallowed traversal (..)' });
   }
 
   const task = enqueueTask({
@@ -1019,11 +1034,15 @@ app.post('/files/write', auth, (req, res) => {
 
 // [Cloud OpenClaw] Read file
 app.post('/files/read', auth, (req, res) => {
-  const { path } = req.body || {};
-  const normalizedPath = normalizeString(path);
+  const { path: reqPath } = req.body || {};
+  const normalizedPath = normalizeString(reqPath);
 
   if (!normalizedPath) {
     return res.status(400).json({ error: 'path is required' });
+  }
+
+  if (hasPathTraversal(normalizedPath)) {
+    return res.status(400).json({ error: 'Path contains disallowed traversal (..)' });
   }
 
   const task = enqueueTask({
@@ -1038,11 +1057,15 @@ app.post('/files/read', auth, (req, res) => {
 
 // [Cloud OpenClaw] Edit file (partial string replacement)
 app.post('/files/edit', auth, (req, res) => {
-  const { path, old_string, new_string, replace_all = false } = req.body || {};
-  const normalizedPath = normalizeString(path);
+  const { path: reqPath, old_string, new_string, replace_all = false } = req.body || {};
+  const normalizedPath = normalizeString(reqPath);
 
   if (!normalizedPath || old_string === undefined || new_string === undefined) {
     return res.status(400).json({ error: 'path, old_string, new_string are required' });
+  }
+
+  if (hasPathTraversal(normalizedPath)) {
+    return res.status(400).json({ error: 'Path contains disallowed traversal (..)' });
   }
 
   const task = enqueueTask({
@@ -1303,7 +1326,12 @@ app.get('/codex/recent', auth, async (req, res) => {
             return { file: f, path: fp, mtime: stat.mtimeMs, size: stat.size, sessionId };
           });
         sessionFiles.push(...files);
-      } catch { /* day directory does not exist, skip */ }
+      } catch (dayDirErr) {
+        // Day directory does not exist or unreadable, skip
+        if (dayDirErr.code !== 'ENOENT') {
+          console.warn(`[Codex Sessions] Error reading ${dayDir}: ${dayDirErr.message}`);
+        }
+      }
     }
   } catch (e) {
     return res.json({ sessions: [], error: errorMessage(e) });
@@ -1341,35 +1369,52 @@ app.get('/codex/recent', auth, async (req, res) => {
 });
 
 // ========== Cleanup Expired Tasks ==========
-setInterval(() => {
-  const now = Date.now();
-  const db = getTaskDb();
-  const expiredResults = db.prepare(`
-    SELECT t.id
-    FROM tasks t
-    INNER JOIN task_results r ON r.task_id = t.id
-    WHERE r.created_at < ?
-  `).all(now - RESULT_EXPIRE_MS);
-  for (const row of expiredResults) {
-    db.prepare(`DELETE FROM task_results WHERE task_id = ?`).run(row.id);
-    db.prepare(`DELETE FROM tasks WHERE id = ?`).run(row.id);
-    console.log(`[Cleanup] Result expired (unfetched): ${row.id}`);
-  }
+const cleanupInterval = setInterval(() => {
+  try {
+    const now = Date.now();
+    const db = getTaskDb();
+    const expiredResults = db.prepare(`
+      SELECT t.id
+      FROM tasks t
+      INNER JOIN task_results r ON r.task_id = t.id
+      WHERE r.created_at < ?
+    `).all(now - RESULT_EXPIRE_MS);
+    for (const row of expiredResults) {
+      db.prepare(`DELETE FROM task_results WHERE task_id = ?`).run(row.id);
+      db.prepare(`DELETE FROM tasks WHERE id = ?`).run(row.id);
+      console.log(`[Cleanup] Result expired (unfetched): ${row.id}`);
+    }
 
-  const expiredTasks = db.prepare(`
-    SELECT id
-    FROM tasks
-    WHERE id NOT IN (SELECT task_id FROM task_results)
-      AND created_at < ?
-  `).all(now - TASK_EXPIRE_MS);
-  for (const row of expiredTasks) {
-    db.prepare(`DELETE FROM tasks WHERE id = ?`).run(row.id);
-    console.log(`[Cleanup] Task expired (no result): ${row.id}`);
-  }
+    const expiredTasks = db.prepare(`
+      SELECT id
+      FROM tasks
+      WHERE id NOT IN (SELECT task_id FROM task_results)
+        AND created_at < ?
+    `).all(now - TASK_EXPIRE_MS);
+    for (const row of expiredTasks) {
+      db.prepare(`DELETE FROM tasks WHERE id = ?`).run(row.id);
+      console.log(`[Cleanup] Task expired (no result): ${row.id}`);
+    }
 
-  cleanupExpiredSessions();
-  trimEvents();
+    cleanupExpiredSessions();
+    trimEvents();
+  } catch (err) {
+    console.error(`[Cleanup] Error during periodic cleanup: ${err.message}`);
+  }
 }, 60000);
+
+// Ensure cleanup interval doesn't prevent Node.js from exiting
+cleanupInterval.unref();
+
+// ========== Unhandled rejection / uncaught exception safety net ==========
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('[FATAL] Unhandled promise rejection:', reason);
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('[FATAL] Uncaught exception:', err.message, err.stack);
+  process.exit(1);
+});
 
 // ========== Startup ==========
 app.listen(PORT, '0.0.0.0', () => {
