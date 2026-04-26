@@ -22,11 +22,11 @@
 
 **问题在哪：** OpenClaw 跑在 Docker 或远程服务器上时，acpx 够不到另一台机器上的 CLI。ACP 是 stdio 协议，没有网络传输层。远程 ACP 在协议规范里还标着"work in progress"。
 
-**tunnel 怎么解决：** 不等远程 ACP 落地，直接用 HTTP 任务队列绕过去。插件（Docker 内）把任务推到 task-api，网络上任意位置的 runner 长轮询拉取任务，spawn CLI，结果通过 callback 直推聊天频道。
+**tunnel 怎么解决：** 不等远程 ACP 落地，直接用 HTTP 任务队列绕过去。插件（Docker 内）把任务推到 task-api，网络上任意位置的 runner 长轮询拉取任务，spawn CLI，再把结果回传给 task-api，由服务端推回聊天频道。
 
 | | acpx | tunnel |
 |---|---|---|
-| 协议 | ACP（stdio JSON-RPC） | HTTP 任务队列 + callback |
+| 协议 | ACP（stdio JSON-RPC） | HTTP 任务队列 + 服务端 callback |
 | 需要同一台机器 | 是 | 不需要 — 跨网络可用 |
 | 会话模型 | 按 git 目录绑定 | 按聊天频道绑定 |
 | token 消耗 | 零（协议层） | 零（协议层） |
@@ -118,7 +118,7 @@ WORKER_URL=http://localhost:3456
 | **零 token 中转** | 纯协议层，不消耗 OpenClaw token 配额 |
 | **平台无关** | Discord、Telegram 或任何 OpenClaw 支持的平台 |
 | **一键配置** | `setup.sh` 生成 `.env`、更新插件配置、安装 LaunchAgent |
-| **并发执行** | 最多 5 个并行任务，自动模型降级 |
+| **并发执行** | 最多 5 个并行任务，可配置 Claude 模型降级 |
 | **SDK + CLI 双模式** | 优先用 Agent SDK（流式输出），失败自动回退到 CLI |
 | **云端就绪** | 本地 Docker、云端 VM、混合部署，随你选 |
 
@@ -147,9 +147,9 @@ docker-compose up -d
 
 ## 三个组件
 
-**`task-api/`** — Docker 里的 Express HTTP 服务。接收插件提交的任务，存入 SQLite，通过长轮询下发给 runner，完成后把结果推回聊天频道。默认端口 3456。
+**`task-api/`** — Docker 里的 Express HTTP 服务。接收插件提交的任务，存入 SQLite，通过长轮询下发给 runner，接收执行结果，并把结果推回聊天频道。默认端口 3456。
 
-**`runner/`** — 宿主机（或任意机器）上的 Node.js 进程。长轮询 task-api，spawn Claude Code / Codex / Gemini CLI（最多 5 个并发）。优先使用 Agent SDK（流式输出），失败自动回退到 CLI 模式。
+**`runner/`** — 宿主机（或任意机器）上的 Node.js 进程。长轮询 task-api，spawn Claude Code / Codex / Gemini CLI（最多 5 个并发），并把执行结果回传给 task-api。优先使用 Agent SDK（流式输出），失败自动回退到 CLI 模式。
 
 **`plugin/`** — OpenClaw TypeScript 插件。注册 `/cc`、`/codex`、`/gemini` 命令族，管理按频道的 session 绑定（SQLite 持久化），向 task-api 提交任务。
 
@@ -179,15 +179,20 @@ docker-compose up -d
 | `PORT` | task-api | 监听端口（默认 `3456`） |
 | `CALLBACK_BOT_TOKEN` | task-api | 用于推送结果的 Bot Token |
 | `CALLBACK_API_BASE_URL` | task-api | Bot API 地址（默认 Discord） |
+| `CALLBACK_CHANNEL` | task-api | 可选兜底频道/子区 ID，任务没有 callbackChannel 时使用 |
 | `WORKER_URL` | runner | task-api 地址（默认 `http://localhost:3456`） |
 | `CLAUDE_PATH` | runner | `claude` 二进制路径（默认 `claude`） |
 | `CODEX_PATH` | runner | `codex` 二进制路径（默认 `codex`） |
 | `GEMINI_PATH` | runner | `gemini` 二进制路径（默认 `gemini`） |
 | `CC_TIMEOUT` | runner | 单任务最大执行时间（默认 `1200000` ms） |
+| `CC_MODELS` | runner | 可选 Claude 模型列表，逗号分隔。留空表示使用 Claude Code 默认模型 |
+| `RUNNER_SESSION_CACHE_FILE` | runner | 可选 session cache 路径。留空使用系统临时目录 |
+| `CC_LOG_PATH` | runner | 可选 Claude live log 路径。留空使用系统临时目录 |
 | `MAX_CONCURRENT` | runner | 最大并发数（默认 `5`） |
 | `POLL_INTERVAL` | runner | 并发满时轮询间隔（默认 `500` ms） |
 | `LONG_POLL_WAIT` | runner | 长轮询等待窗口（默认 `30000` ms） |
-| `DISCORD_PROXY` | runner | HTTPS 代理（可选，用于回调推送） |
+| `WORKER_DIRECT_CALLBACK` | runner | 旧路径开关：是否让 runner 直接调用 callback API。Windows / 云端部署保持 `false` |
+| `DISCORD_PROXY` | runner | 旧路径的 HTTPS 代理（可选） |
 
 plugin 的配置在 `plugin/openclaw.plugin.json` 的 `config` 字段里，`setup.sh` 自动写入。
 
@@ -202,6 +207,17 @@ macOS 用 LaunchAgent 自启。Linux 或云端服务器手动运行：
 cd runner
 WORKER_URL=http://localhost:3456 WORKER_TOKEN=你的token node worker.js
 ```
+
+Windows 上可以直接运行：
+
+```bat
+cd runner
+set "WORKER_URL=http://your-server:3456"
+set "WORKER_TOKEN=你的token"
+start-worker.bat
+```
+
+Windows 启动脚本默认用 `%TEMP%` 保存 session cache 和 live log。保持 `WORKER_DIRECT_CALLBACK=false`，让 Windows 只把结果回传给 task-api，由服务端负责推送聊天 callback。
 
 或配 systemd 持久运行：
 

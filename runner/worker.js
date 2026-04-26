@@ -12,6 +12,7 @@ import https from 'https';
 import http from 'http';
 import fs from 'fs';
 import path from 'path';
+import os from 'os';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 
 // Prevent nesting detection (needed when launched from within CC)
@@ -23,6 +24,53 @@ function parseConfigInt(value, fallback, min = 1, max = Number.MAX_SAFE_INTEGER)
   if (parsed < min) return min;
   if (parsed > max) return max;
   return parsed;
+}
+
+function defaultTempFile(fileName) {
+  return path.join(os.tmpdir(), fileName);
+}
+
+function normalizeClaudeModel(model) {
+  const value = String(model ?? '').trim();
+  if (!value) return null;
+  if (/^(default|auto|none)$/i.test(value)) return null;
+  return value;
+}
+
+function parseClaudeModelList(value) {
+  return String(value ?? '')
+    .split(',')
+    .map((model) => model.trim())
+    .filter(Boolean)
+    .map(normalizeClaudeModel);
+}
+
+function getClaudeModelCandidates(taskModel) {
+  const taskModels = parseClaudeModelList(taskModel);
+  if (taskModels.length > 0) return taskModels;
+
+  const configured = process.env.CC_MODELS ?? process.env.CC_MODEL ?? '';
+  const envModels = parseClaudeModelList(configured);
+  return envModels.length > 0 ? envModels : [null];
+}
+
+function formatClaudeModel(model) {
+  return model || 'Claude default';
+}
+
+function shouldRetryClaudeModel(result) {
+  if (!result || result.exitCode === 0) return false;
+  const message = `${result.error || ''}\n${result.stderr || ''}\n${result.stdout || ''}`.toLowerCase();
+  return message.includes('model') && (
+    message.includes('not supported') ||
+    message.includes('invalid_parameter') ||
+    message.includes('unknown model') ||
+    message.includes('invalid model')
+  );
+}
+
+function envFlagEnabled(value) {
+  return /^(1|true|yes|on)$/i.test(String(value ?? '').trim());
 }
 
 // ========== Agent SDK loading (falls back to CLI on failure) ==========
@@ -60,7 +108,7 @@ const CONFIG = {
   openclawHooksToken: process.env.OPENCLAW_HOOKS_TOKEN || 'cc-callback-2026',
   callbackApiBaseUrl: process.env.CALLBACK_API_BASE_URL || 'https://discord.com/api/v10',
   // Runner local provider session cache, used only for local resume / mapping recovery
-  runnerSessionCacheFile: process.env.RUNNER_SESSION_CACHE_FILE || '/tmp/openclaw-runner-session-cache.json',
+  runnerSessionCacheFile: process.env.RUNNER_SESSION_CACHE_FILE || defaultTempFile('openclaw-runner-session-cache.json'),
 };
 
 // Token redaction helper -- mask tokens in log output to prevent accidental leakage
@@ -273,9 +321,22 @@ function expandHome(filePath) {
 function isPathSafe(resolvedPath) {
   const home = process.env.HOME;
   const normalized = path.resolve(resolvedPath);
-  // Allow paths under HOME, /tmp, and /var/tmp
-  const allowedRoots = [home, '/tmp', '/var/tmp'];
-  return allowedRoots.some(root => normalized.startsWith(root + path.sep) || normalized === root);
+  const allowedRoots = [home, os.tmpdir(), process.env.TMP, process.env.TEMP, '/tmp', '/var/tmp']
+    .filter(Boolean)
+    .map((root) => path.resolve(expandHome(root)));
+
+  return allowedRoots.some((root) => {
+    const candidate = process.platform === 'win32' ? normalized.toLowerCase() : normalized;
+    const allowed = process.platform === 'win32' ? root.toLowerCase() : root;
+    return candidate === allowed || candidate.startsWith(allowed.endsWith(path.sep) ? allowed : `${allowed}${path.sep}`);
+  });
+}
+
+function allowedRootsMessage() {
+  return [process.env.HOME, os.tmpdir(), process.env.TMP, process.env.TEMP, '/tmp', '/var/tmp']
+    .filter(Boolean)
+    .map((root) => path.resolve(expandHome(root)))
+    .join(', ');
 }
 
 function writeFileToDisk(filePath, content, encoding) {
@@ -288,7 +349,7 @@ function writeFileToDisk(filePath, content, encoding) {
         console.warn(`[Write] BLOCKED: path traversal attempt: ${fullPath}`);
         return resolve({
           stdout: '',
-          stderr: `Path not allowed: must be under $HOME, /tmp, or /var/tmp`,
+          stderr: `Path not allowed: must be under one of: ${allowedRootsMessage()}`,
           exitCode: 1,
           error: 'Path traversal blocked'
         });
@@ -330,7 +391,7 @@ function readFileFromDisk(filePath) {
         console.warn(`[Read] BLOCKED: path traversal attempt: ${fullPath}`);
         return resolve({
           stdout: '',
-          stderr: `Path not allowed: must be under $HOME, /tmp, or /var/tmp`,
+          stderr: `Path not allowed: must be under one of: ${allowedRootsMessage()}`,
           exitCode: 1,
           error: 'Path traversal blocked'
         });
@@ -361,7 +422,7 @@ function editFileOnDisk(filePath, oldString, newString, replaceAll) {
         console.warn(`[Edit] BLOCKED: path traversal attempt: ${fullPath}`);
         return resolve({
           stdout: '',
-          stderr: `Path not allowed: must be under $HOME, /tmp, or /var/tmp`,
+          stderr: `Path not allowed: must be under one of: ${allowedRootsMessage()}`,
           exitCode: 1,
           error: 'Path traversal blocked'
         });
@@ -800,12 +861,13 @@ async function executeClaudeSDK(prompt, timeout, sessionId, callbackChannel, mod
 
   // Build options (resume also needs permission config, otherwise subprocess exits immediately).
   // model is passed in by the caller, supports fallback retry.
+  const selectedModel = normalizeClaudeModel(model);
   const baseOptions = {
-    model: model || 'claude-opus-4-6',
     permissionMode: 'bypassPermissions',
     allowDangerouslySkipPermissions: true,
     cwd: process.env.HOME,
   };
+  if (selectedModel) baseOptions.model = selectedModel;
   const options = isResume
     ? { ...baseOptions, resume: sdkSessionId }
     : {
@@ -1107,7 +1169,7 @@ function executeGeminiCLI(prompt, timeout, resumeLatest, model) {
 const CLAUDE_PATH = process.env.CLAUDE_PATH || 'claude';
 const CODEX_PATH = process.env.CODEX_PATH || 'codex';
 const GEMINI_PATH = process.env.GEMINI_PATH || 'gemini';
-const CC_LOG = process.env.CC_LOG_PATH || '/tmp/cc-live.log';
+const CC_LOG = process.env.CC_LOG_PATH || defaultTempFile('cc-live.log');
 
 function buildCliEnv(extra = {}) {
   return {
@@ -1121,10 +1183,11 @@ function buildCliEnv(extra = {}) {
 function executeClaudeCLI(prompt, timeout, sessionId, model) {
   return new Promise((resolve) => {
     const startTime = Date.now();
-    const useModel = model || 'claude-opus-4-6';
-    console.log(`[Claude CLI] Executing [${useModel}]: "${prompt.slice(0, 50)}..."${sessionId ? ' [session:' + sessionId.slice(0, 8) + ']' : ''}`);
+    const useModel = normalizeClaudeModel(model);
+    console.log(`[Claude CLI] Executing [${formatClaudeModel(useModel)}]: "${prompt.slice(0, 50)}..."${sessionId ? ' [session:' + sessionId.slice(0, 8) + ']' : ''}`);
 
-    const args = ['--print', '--model', useModel];
+    const args = ['--print'];
+    if (useModel) args.push('--model', useModel);
     if (sessionId) {
       if (ccSessions.has(sessionId)) {
         args.push('--resume', sessionId);
@@ -1339,22 +1402,25 @@ async function executeTask(task) {
       // Short ID prefix resolution (/cc-recent shows 8-char IDs, need to resolve to full UUID)
       if (task.sessionId) task.sessionId = resolveSessionPrefix(task.sessionId);
       console.log(`[${runningTasks.size}/${CONFIG.maxConcurrent}] [Claude ${sdkQuery ? 'SDK' : 'CLI'}] ${taskId} ${describeTaskMode(task)} - ${task.prompt?.slice(0, 50)}...`);
-      // Ack already handled by cc-bridge registerCommand, worker doesn't push again
-      // CC model fallback: Opus → Sonnet (uses CC default if unspecified)
-      const CC_MODELS = ['claude-opus-4-6', 'claude-sonnet-4-6'];
-      for (let i = 0; i < CC_MODELS.length; i++) {
-        const model = CC_MODELS[i];
+      // Ack already handled by cc-bridge registerCommand, worker doesn't push again.
+      // Uses Claude Code's configured default unless CC_MODELS/CC_MODEL or task.model is set.
+      const ccModels = getClaudeModelCandidates(task.model);
+      for (let i = 0; i < ccModels.length; i++) {
+        const model = ccModels[i];
         try {
           if (sdkQuery) {
             result = await executeClaudeSDK(task.prompt, task.timeout, task.sessionId, task.callbackChannel, model);
           } else {
             result = await executeClaudeCLI(task.prompt, task.timeout, task.sessionId, model);
           }
-          // Success or normal exit (non-zero exitCode counts as complete, no retry)
+          if (i < ccModels.length - 1 && shouldRetryClaudeModel(result)) {
+            console.warn(`[CC Fallback] ${formatClaudeModel(model)} was rejected, falling back to ${formatClaudeModel(ccModels[i + 1])}`);
+            continue;
+          }
           break;
         } catch (err) {
-          const isLast = i === CC_MODELS.length - 1;
-          console.warn(`[CC Fallback] ${model} failed: ${err.message}${isLast ? '' : ', falling back to ' + CC_MODELS[i + 1]}`);
+          const isLast = i === ccModels.length - 1;
+          console.warn(`[CC Fallback] ${formatClaudeModel(model)} failed: ${err.message}${isLast ? '' : ', falling back to ' + formatClaudeModel(ccModels[i + 1])}`);
           if (isLast) throw err;
         }
       }
@@ -1379,8 +1445,11 @@ async function executeTask(task) {
       ...result
     });
 
-    // Callback notification to bot-side channel after CC task completes
-    notifyCompletion(task, result);
+    // Default delivery is server-side: worker reports results to task-api and avoids
+    // making bot API calls from Windows/client networks. Keep the old path opt-in.
+    if (envFlagEnabled(process.env.WORKER_DIRECT_CALLBACK)) {
+      notifyCompletion(task, result);
+    }
 
     const status = result.exitCode === 0 ? '✓' : '✗';
     console.log(`[Done] ${status} ${taskId}... (remaining: ${runningTasks.size - 1})`);

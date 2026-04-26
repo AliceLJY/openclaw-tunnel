@@ -22,11 +22,11 @@
 
 **The problem:** when OpenClaw runs in Docker or on a remote server, acpx cannot reach a CLI on another machine. ACP is a stdio protocol with no network transport. Remote ACP is still "work in progress" in the spec.
 
-**What tunnel does:** instead of waiting for remote ACP, tunnel bridges the gap with an HTTP task queue. The plugin (inside Docker) enqueues tasks to `task-api`. A runner anywhere on the network long-polls for tasks, spawns the CLI, and posts results back to your chat channel via callback.
+**What tunnel does:** instead of waiting for remote ACP, tunnel bridges the gap with an HTTP task queue. The plugin (inside Docker) enqueues tasks to `task-api`. A runner anywhere on the network long-polls for tasks, spawns the CLI, and reports the result back to `task-api`, which posts it to your chat channel.
 
 | | acpx | tunnel |
 |---|---|---|
-| Protocol | ACP (JSON-RPC over stdio) | HTTP task queue + callback |
+| Protocol | ACP (JSON-RPC over stdio) | HTTP task queue + server callback |
 | Same machine required | Yes | No — works across networks |
 | Session model | By git directory | By chat channel |
 | Token cost | Zero (protocol layer) | Zero (protocol layer) |
@@ -118,7 +118,7 @@ WORKER_URL=http://localhost:3456
 | **Zero-token relay** | Protocol layer only — no LLM calls in the plugin or runner |
 | **Platform agnostic** | Discord, Telegram, or any platform OpenClaw supports |
 | **One-command setup** | `setup.sh` generates `.env`, updates plugin config, installs LaunchAgent |
-| **Concurrent execution** | Up to 5 parallel tasks with automatic model fallback |
+| **Concurrent execution** | Up to 5 parallel tasks with configurable Claude model fallback |
 | **SDK + CLI modes** | Agent SDK (streaming) with automatic fallback to CLI |
 | **Cloud-ready** | Deploy anywhere — local Docker, cloud VM, or hybrid |
 
@@ -147,9 +147,9 @@ After setup, copy `plugin/` into your OpenClaw plugins folder (or reference it i
 
 ## Components
 
-**`task-api/`** — Express HTTP server in Docker. Accepts tasks from the plugin, stores them in SQLite, serves them to the runner via long-polling, and posts results back to your chat via bot callback. Default port 3456.
+**`task-api/`** — Express HTTP server in Docker. Accepts tasks from the plugin, stores them in SQLite, serves them to the runner via long-polling, receives completed results, and posts results back to your chat via bot callback. Default port 3456.
 
-**`runner/`** — Node.js worker on the host (or any machine). Long-polls `task-api`, spawns Claude Code / Codex / Gemini CLI as child processes (up to 5 concurrent), and reports results back. Prefers Agent SDK with streaming, auto-fallback to CLI mode.
+**`runner/`** — Node.js worker on the host (or any machine). Long-polls `task-api`, spawns Claude Code / Codex / Gemini CLI as child processes (up to 5 concurrent), and reports execution results back to `task-api`. Prefers Agent SDK with streaming, auto-fallback to CLI mode.
 
 **`plugin/`** — OpenClaw plugin (TypeScript). Registers `/cc`, `/codex`, `/gemini` command families, manages per-channel session bindings in SQLite, and submits tasks to `task-api`.
 
@@ -179,15 +179,20 @@ Copy `.env.example` to `.env` (or let `setup.sh` generate it):
 | `PORT` | task-api | Port task-api listens on (default: `3456`) |
 | `CALLBACK_BOT_TOKEN` | task-api | Bot token for posting results back |
 | `CALLBACK_API_BASE_URL` | task-api | Bot API base URL (default: Discord) |
+| `CALLBACK_CHANNEL` | task-api | Optional fallback channel/thread ID when a task has no callback channel |
 | `WORKER_URL` | runner | URL to reach task-api (default: `http://localhost:3456`) |
 | `CLAUDE_PATH` | runner | Path to `claude` binary (default: `claude`) |
 | `CODEX_PATH` | runner | Path to `codex` binary (default: `codex`) |
 | `GEMINI_PATH` | runner | Path to `gemini` binary (default: `gemini`) |
 | `CC_TIMEOUT` | runner | Max execution time per task in ms (default: `1200000`) |
+| `CC_MODELS` | runner | Optional comma-separated Claude model list. Empty means use Claude Code's default model |
+| `RUNNER_SESSION_CACHE_FILE` | runner | Optional session cache path. Empty uses the OS temp directory |
+| `CC_LOG_PATH` | runner | Optional Claude live log path. Empty uses the OS temp directory |
 | `MAX_CONCURRENT` | runner | Max parallel tasks (default: `5`) |
 | `POLL_INTERVAL` | runner | Polling interval when at capacity (default: `500` ms) |
 | `LONG_POLL_WAIT` | runner | Long-poll wait window (default: `30000` ms) |
-| `DISCORD_PROXY` | runner | HTTPS proxy for callback delivery (optional) |
+| `WORKER_DIRECT_CALLBACK` | runner | Legacy opt-in for runner-side callback delivery. Keep `false` for Windows/cloud setups |
+| `DISCORD_PROXY` | runner | HTTPS proxy for legacy runner-side callback delivery (optional) |
 
 The plugin reads `apiUrl`, `apiToken`, and `callbackChannel` from `plugin/openclaw.plugin.json` — `setup.sh` populates these automatically.
 
@@ -202,6 +207,17 @@ The plugin reads `apiUrl`, `apiToken`, and `callbackChannel` from `plugin/opencl
 cd runner
 WORKER_URL=http://localhost:3456 WORKER_TOKEN=your-token node worker.js
 ```
+
+On Windows, run:
+
+```bat
+cd runner
+set "WORKER_URL=http://your-server:3456"
+set "WORKER_TOKEN=your-token"
+start-worker.bat
+```
+
+The Windows launcher uses `%TEMP%` for the session cache and live log by default. Leave `WORKER_DIRECT_CALLBACK=false` so Windows only reports results to `task-api`; the server sends the chat callback.
 
 Or register as a systemd service for always-on operation:
 

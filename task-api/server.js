@@ -30,6 +30,8 @@ const EVENT_RETENTION_DAYS = parseBoundedInt(process.env.WORKER_EVENT_RETENTION_
 const EVENT_DB_PATH = process.env.WORKER_EVENT_DB || '/data/events.db';
 const TASK_DB_PATH = process.env.WORKER_TASK_DB || '/data/tasks.db';
 const CALLBACK_API_BASE_URL = process.env.CALLBACK_API_BASE_URL || process.env.DISCORD_API_BASE_URL || 'https://discord.com/api/v10';
+const CALLBACK_BOT_TOKEN = process.env.CALLBACK_BOT_TOKEN || process.env.DISCORD_BOT_TOKEN || '';
+const DEFAULT_CALLBACK_CHANNEL = process.env.CALLBACK_CHANNEL || process.env.DEFAULT_CALLBACK_CHANNEL || '';
 const TASK_EXPIRE_MS = parseBoundedInt(process.env.WORKER_TASK_RETENTION_MS, 20 * 60 * 1000, {
   min: 60 * 1000,
   max: 7 * 24 * 60 * 60 * 1000,
@@ -88,6 +90,14 @@ function parseTaskTimeout(value, fallback) {
 function previewText(text, max = 50) {
   const compact = String(text ?? '').replace(/\s+/g, ' ').trim();
   return compact.length > max ? `${compact.slice(0, max)}...` : compact;
+}
+
+function normalizeCallbackChannel(value) {
+  const channel = normalizeOptionalString(value);
+  if (!channel) return null;
+  if (channel.startsWith('slash:')) return channel.slice(6);
+  if (channel.startsWith('channel:')) return channel.slice(8);
+  return channel;
 }
 
 function extractDispatchMeta(body, defaultEntrypoint) {
@@ -572,6 +582,123 @@ function runEventMaintenance({ vacuum = false } = {}) {
   };
 }
 
+const CLI_TASK_TYPES = new Set(['claude-cli', 'codex-cli', 'gemini-cli']);
+const CLI_LABELS = { 'claude-cli': 'CC', 'codex-cli': 'Codex', 'gemini-cli': 'Gemini' };
+
+function callbackTokenForTask(task) {
+  return normalizeOptionalString(task?.callbackBotToken) || CALLBACK_BOT_TOKEN || null;
+}
+
+function buildCompletionMessage(task, result) {
+  const label = CLI_LABELS[task?.type] || task?.type || 'Task';
+  const output = result.stdout || result.stderr || result.error || '(no output)';
+  const sessionId = result.metadata?.sessionId || task?.sessionId || null;
+  const sessionInfo = sessionId ? `\nSession: \`${String(sessionId).slice(0, 8)}\`` : '';
+
+  if (result.exitCode === 0) {
+    return output.length > 2000 ? `${output.slice(0, 1997)}...` : output;
+  }
+
+  const duration = result.duration ? `${Math.round(result.duration / 1000)}s` : 'unknown';
+  const message = `**${label} failed (${duration})**${sessionInfo}\n\n${output}`;
+  return message.length > 2000 ? `${message.slice(0, 1997)}...` : message;
+}
+
+async function sendCallbackMessage(channel, message, botToken) {
+  const callbackApiBase = CALLBACK_API_BASE_URL.endsWith('/') ? CALLBACK_API_BASE_URL : `${CALLBACK_API_BASE_URL}/`;
+  const callbackUrl = new URL(`channels/${channel}/messages`, callbackApiBase).toString();
+  const resp = await fetch(callbackUrl, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bot ${botToken}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ content: message.slice(0, 2000) }),
+  });
+
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`Callback API ${resp.status}: ${text}`);
+  }
+
+  return resp.status;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function sendCallbackMessageWithRetry(channel, message, botToken, maxRetries = 5) {
+  let lastError = null;
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      const status = await sendCallbackMessage(channel, message, botToken);
+      return { status, attempts: attempt };
+    } catch (err) {
+      lastError = err;
+      if (attempt >= maxRetries) break;
+      const backoff = Math.min(attempt * 3000, 15000);
+      console.error(`[Callback] Attempt #${attempt} failed, retrying in ${backoff / 1000}s: ${errorMessage(err)}`);
+      await sleep(backoff);
+    }
+  }
+  throw lastError || new Error('Callback failed');
+}
+
+async function dispatchCompletionCallback(task, result) {
+  if (!task || !CLI_TASK_TYPES.has(task.type)) return false;
+  if (task.responseMode && task.responseMode !== 'direct-callback') return false;
+
+  const channel = normalizeCallbackChannel(task.callbackChannel) || normalizeCallbackChannel(DEFAULT_CALLBACK_CHANNEL);
+  if (!channel) return false;
+
+  const botToken = callbackTokenForTask(task);
+  if (!botToken) {
+    appendEvent('callback.failed', task, {
+      taskId: task.id,
+      taskStatus: task.status,
+      sessionId: result.metadata?.sessionId || task.sessionId || null,
+      details: {
+        channel,
+        error: 'CALLBACK_BOT_TOKEN not set',
+      },
+    });
+    console.error(`[Callback] Cannot send ${task.id}: CALLBACK_BOT_TOKEN not set`);
+    return false;
+  }
+
+  appendEvent('callback.dispatched', task, {
+    taskId: task.id,
+    taskStatus: task.status,
+    sessionId: result.metadata?.sessionId || task.sessionId || null,
+    details: { channel },
+  });
+
+  try {
+    const { status, attempts } = await sendCallbackMessageWithRetry(channel, buildCompletionMessage(task, result), botToken);
+    appendEvent('callback.sent', task, {
+      taskId: task.id,
+      taskStatus: task.status,
+      sessionId: result.metadata?.sessionId || task.sessionId || null,
+      details: { channel, status, attempts },
+    });
+    console.log(`[Callback] Sent ${task.id} to ${channel}${attempts > 1 ? ` [attempt #${attempts}]` : ''}`);
+    return true;
+  } catch (err) {
+    appendEvent('callback.failed', task, {
+      taskId: task.id,
+      taskStatus: task.status,
+      sessionId: result.metadata?.sessionId || task.sessionId || null,
+      details: {
+        channel,
+        error: errorMessage(err),
+      },
+    });
+    console.error(`[Callback] Failed ${task.id}: ${errorMessage(err)}`);
+    return false;
+  }
+}
+
 function listEvents({ limit, taskId, type }) {
   const conditions = [];
   const params = [];
@@ -911,7 +1038,7 @@ app.get('/worker/poll', auth, async (req, res) => {
 
 // [Local worker] Report task result
 app.post('/worker/result', auth, (req, res) => {
-  const { taskId, stdout, stderr, exitCode, error, metadata } = req.body || {};
+  const { taskId, stdout, stderr, exitCode, error, duration, metadata } = req.body || {};
 
   if (!taskId) {
     return res.status(400).json({ error: 'taskId is required' });
@@ -923,6 +1050,7 @@ app.post('/worker/result', auth, (req, res) => {
     stderr: stderr || '',
     exitCode: exitCode ?? -1,
     error: error || null,
+    duration: Number.isFinite(duration) ? duration : null,
     completedAt: Date.now()
   };
 
@@ -970,6 +1098,10 @@ app.post('/worker/result', auth, (req, res) => {
       timestamp: Date.now(),
     });
   }
+
+  dispatchCompletionCallback(task, result).catch((err) => {
+    console.error(`[Callback] Unexpected error for ${taskId}: ${errorMessage(err)}`);
+  });
 
   res.json({ success: true });
 });
@@ -1085,7 +1217,7 @@ app.post('/files/edit', auth, (req, res) => {
 
 // [Cloud OpenClaw] Execute local Claude Code CLI
 app.post('/claude', auth, (req, res) => {
-  const { prompt, timeout = 120000, sessionId, callbackChannel, callbackBotToken } = req.body || {};
+  const { prompt, timeout = 120000, sessionId, model, callbackChannel, callbackBotToken } = req.body || {};
   const promptText = typeof prompt === 'string' ? prompt : '';
   const requestedSessionId = normalizeOptionalString(sessionId);
   const dispatchMeta = extractDispatchMeta(req.body, 'cc');
@@ -1101,6 +1233,7 @@ app.post('/claude', auth, (req, res) => {
     prompt: promptText,
     timeout: parseTaskTimeout(timeout, 120000),
     sessionId: effectiveSessionId,
+    model: normalizeOptionalString(model),
     callbackChannel: normalizeOptionalString(callbackChannel),
     callbackBotToken: normalizeOptionalString(callbackBotToken),
     ...dispatchMeta,
@@ -1115,7 +1248,7 @@ app.post('/claude', auth, (req, res) => {
   });
 
   const isResume = Boolean(requestedSessionId);
-  console.log(`[Claude] Task: ${task.id} [mode:${task.dispatchMode}] [session:${effectiveSessionId.slice(0, 8)}${isResume ? ',resume' : ',new'}]${task.callbackChannel ? ' [callback:' + task.callbackChannel + ']' : ''}${task.entrypoint ? ' [via:' + task.entrypoint + ']' : ''} - ${previewText(promptText)}`);
+  console.log(`[Claude] Task: ${task.id} [mode:${task.dispatchMode}] [session:${effectiveSessionId.slice(0, 8)}${isResume ? ',resume' : ',new'}]${task.model ? ' [' + task.model + ']' : ''}${task.callbackChannel ? ' [callback:' + task.callbackChannel + ']' : ''}${task.entrypoint ? ' [via:' + task.entrypoint + ']' : ''} - ${previewText(promptText)}`);
 
   res.json({ taskId: task.id, sessionId: effectiveSessionId, message: 'Claude CLI task created' });
 });
@@ -1197,32 +1330,18 @@ app.post('/gemini', auth, (req, res) => {
 
 // Let bridge / hook send bot callbacks through task-api (currently defaults to Discord channel message API)
 app.post('/notify', auth, async (req, res) => {
-  const channel = normalizeString(req.body?.channel);
+  const channel = normalizeCallbackChannel(req.body?.channel);
   const message = typeof req.body?.message === 'string' ? req.body.message : '';
   if (!channel || !message.trim()) {
     return res.status(400).json({ error: 'channel and message are required' });
   }
-  const callbackBotToken = process.env.CALLBACK_BOT_TOKEN;
+  const callbackBotToken = CALLBACK_BOT_TOKEN;
   if (!callbackBotToken) {
     return res.status(500).json({ error: 'CALLBACK_BOT_TOKEN not set' });
   }
   try {
-    const callbackApiBase = CALLBACK_API_BASE_URL.endsWith('/') ? CALLBACK_API_BASE_URL : `${CALLBACK_API_BASE_URL}/`;
-    const callbackUrl = new URL(`channels/${channel}/messages`, callbackApiBase).toString();
-    const resp = await fetch(callbackUrl, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bot ${callbackBotToken}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ content: message.slice(0, 2000) }),
-    });
-    if (resp.ok) {
-      res.json({ ok: true });
-    } else {
-      const text = await resp.text();
-      res.status(502).json({ error: `Callback API ${resp.status}: ${text}` });
-    }
+    const status = await sendCallbackMessage(channel, message, callbackBotToken);
+    res.json({ ok: true, status });
   } catch (err) {
     res.status(502).json({ error: errorMessage(err) });
   }
@@ -1423,7 +1542,7 @@ app.listen(PORT, '0.0.0.0', () => {
   trimEvents();
   console.log(`✅ Task API running on :${PORT}`);
   console.log(`   Token : ${AUTH_TOKEN.slice(0, 4)}${'*'.repeat(AUTH_TOKEN.length - 4)}`);
-  console.log(`   Notify: ${process.env.CALLBACK_BOT_TOKEN || process.env.DISCORD_BOT_TOKEN ? '✓ CALLBACK_BOT_TOKEN/DISCORD_BOT_TOKEN set' : '✗ no CALLBACK_BOT_TOKEN or DISCORD_BOT_TOKEN'}`);
+  console.log(`   Notify: ${CALLBACK_BOT_TOKEN ? '✓ CALLBACK_BOT_TOKEN/DISCORD_BOT_TOKEN set' : '✗ no CALLBACK_BOT_TOKEN or DISCORD_BOT_TOKEN'}`);
   console.log(`   Tasks : ${TASK_DB_PATH} | total=${queue.total} | results=${queue.unconsumedResults}`);
   console.log(`   Events: ${EVENT_DB_PATH} | retention=${EVENT_RETENTION_DAYS}d | max=${MAX_EVENTS}`);
   if (requeued > 0) {

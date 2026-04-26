@@ -22,6 +22,7 @@ services:
       - PORT=${PORT:-3456}
       - CALLBACK_BOT_TOKEN=${CALLBACK_BOT_TOKEN}
       - CALLBACK_API_BASE_URL=${CALLBACK_API_BASE_URL:-https://discord.com/api/v10}
+      - CALLBACK_CHANNEL=${CALLBACK_CHANNEL:-}
       - WORKER_TASK_DB=/data/tasks.db
     volumes:
       - tunnel-data:/data    # Persistent storage for task DB + event DB

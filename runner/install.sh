@@ -23,6 +23,10 @@ CLAUDE_PATH="${CLAUDE_PATH:-claude}"
 CODEX_PATH="${CODEX_PATH:-codex}"
 GEMINI_PATH="${GEMINI_PATH:-gemini}"
 CC_TIMEOUT="${CC_TIMEOUT:-1200000}"
+CC_MODELS="${CC_MODELS:-}"
+RUNNER_SESSION_CACHE_FILE="${RUNNER_SESSION_CACHE_FILE:-}"
+CC_LOG_PATH="${CC_LOG_PATH:-}"
+WORKER_DIRECT_CALLBACK="${WORKER_DIRECT_CALLBACK:-false}"
 NODE_PATH="$(which node 2>/dev/null || echo "/usr/local/bin/node")"
 
 if [[ -z "$WORKER_TOKEN" ]]; then
@@ -68,6 +72,14 @@ cat > "$PLIST_PATH" <<PLIST
     <string>${GEMINI_PATH}</string>
     <key>CC_TIMEOUT</key>
     <string>${CC_TIMEOUT}</string>
+    <key>CC_MODELS</key>
+    <string>${CC_MODELS}</string>
+    <key>RUNNER_SESSION_CACHE_FILE</key>
+    <string>${RUNNER_SESSION_CACHE_FILE}</string>
+    <key>CC_LOG_PATH</key>
+    <string>${CC_LOG_PATH}</string>
+    <key>WORKER_DIRECT_CALLBACK</key>
+    <string>${WORKER_DIRECT_CALLBACK}</string>
   </dict>
   <key>WorkingDirectory</key>
   <string>${SCRIPT_DIR}</string>

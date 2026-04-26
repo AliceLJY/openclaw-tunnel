@@ -3,7 +3,7 @@
  *
  * Architecture (inspired by HappyClaw):
  * - /cc commands are registered via registerCommand — zero agent tokens, zero noise
- * - CC results are pushed directly to the callback channel by the worker (Discord Bot API compatible), bypassing agent formatting
+ * - CLI results are pushed by task-api to the callback channel, bypassing agent formatting
  * - cc_call and similar tools are reserved for agents in other channels
  *
  * Usage (any channel):
@@ -462,7 +462,7 @@ const ccCallTool = {
   label: "Call Claude Code",
   description:
     "Submit a task to Claude Code via task-api. Returns immediately. " +
-    "CC's output will be delivered DIRECTLY to the callback channel via callback (not through you). " +
+    "CC's output will be delivered DIRECTLY to the callback channel by task-api (not through you). " +
     "IMPORTANT: Always pass 'channel' so the result is delivered to the CURRENT channel. " +
     "For NEW tasks: provide 'prompt' and 'channel'. " +
     "For FOLLOW-UP in an existing session: also provide 'sessionId'. " +
@@ -519,7 +519,7 @@ const codexCallTool = {
   label: "Call Codex CLI",
   description:
     "Submit a task to OpenAI Codex CLI via task-api. Returns immediately. " +
-    "Codex's output will be delivered DIRECTLY to the callback channel via callback (not through you). " +
+    "Codex's output will be delivered DIRECTLY to the callback channel by task-api (not through you). " +
     "IMPORTANT: Always pass 'channel' so the result is delivered to the CURRENT channel. " +
     "After calling this tool, tell the user 'Submitted, waiting for Codex callback' and STOP.",
   parameters: {
@@ -574,7 +574,7 @@ const geminiCallTool = {
   label: "Call Gemini CLI",
   description:
     "Submit a task to Google Gemini CLI via task-api. Returns immediately. " +
-    "Gemini's output will be delivered DIRECTLY to the callback channel via callback (not through you). " +
+    "Gemini's output will be delivered DIRECTLY to the callback channel by task-api (not through you). " +
     "IMPORTANT: Always pass 'channel' so the result is delivered to the CURRENT channel. " +
     "After calling this tool, tell the user 'Submitted, waiting for Gemini callback' and STOP.",
   parameters: {
