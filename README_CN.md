@@ -16,6 +16,11 @@
 
 ---
 
+> **Status: Maintenance mode.** 4-30 Hermes 切换后，OpenClaw 主路径已退役；
+> 本工具仅服务 LanceDB Test bot 这一个剩余 OpenClaw 容器。
+
+---
+
 ## 为什么需要 tunnel？
 
 [acpx](https://github.com/openclaw/acpx) 是 OpenClaw 官方的 CLI 客户端，基于 [Agent Client Protocol](https://agentclientprotocol.com/)（ACP）。acpx 通过 stdio 直接 spawn 本地 CLI 进程，快、零开销、协议原生。如果 OpenClaw 和 Claude Code 在同一台机器上，用 acpx 就对了。
