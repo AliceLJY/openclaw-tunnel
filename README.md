@@ -16,8 +16,9 @@
 
 ---
 
-> **Status: Maintenance mode.** 4-30 Hermes 切换后，OpenClaw 主路径已退役；
-> 本工具仅服务 LanceDB Test bot 这一个剩余 OpenClaw 容器。
+> **Status: Maintenance mode.** After the 4-30 Hermes migration the main OpenClaw path is retired;
+> this tool now serves just one remaining OpenClaw container — the LanceDB Test bot, which reaches
+> Mac host resources through the task-api channel (configured in the container's workspace `TOOLS.md`).
 
 ---
 

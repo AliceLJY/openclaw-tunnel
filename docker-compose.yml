@@ -28,7 +28,7 @@ services:
       - tunnel-data:/data    # Persistent storage for task DB + event DB
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:${PORT:-3456}/health"]
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:${PORT:-3456}/health"]
       interval: 30s
       timeout: 5s
       retries: 3
