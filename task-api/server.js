@@ -19,7 +19,7 @@ function errorMessage(err) {
 
 // ========== Configuration ==========
 const AUTH_TOKEN = process.env.WORKER_TOKEN || 'change-me-to-a-secure-token';
-const PORT = process.env.WORKER_PORT || 3456;
+const PORT = process.env.PORT || process.env.WORKER_PORT || 3456;
 const DEFAULT_TASK_TIMEOUT_MS = 30000;
 const DEFAULT_POLL_WAIT_MS = 30000;
 const MAX_POLL_WAIT_MS = 60000;
@@ -32,7 +32,7 @@ const TASK_DB_PATH = process.env.WORKER_TASK_DB || '/data/tasks.db';
 const CALLBACK_API_BASE_URL = process.env.CALLBACK_API_BASE_URL || process.env.DISCORD_API_BASE_URL || 'https://discord.com/api/v10';
 const CALLBACK_BOT_TOKEN = process.env.CALLBACK_BOT_TOKEN || process.env.DISCORD_BOT_TOKEN || '';
 const DEFAULT_CALLBACK_CHANNEL = process.env.CALLBACK_CHANNEL || process.env.DEFAULT_CALLBACK_CHANNEL || '';
-const TASK_EXPIRE_MS = parseBoundedInt(process.env.WORKER_TASK_RETENTION_MS, 20 * 60 * 1000, {
+const TASK_EXPIRE_MS = parseBoundedInt(process.env.WORKER_TASK_RETENTION_MS, 60 * 60 * 1000, {
   min: 60 * 1000,
   max: 7 * 24 * 60 * 60 * 1000,
 });
@@ -650,7 +650,15 @@ async function dispatchCompletionCallback(task, result) {
   if (task.responseMode && task.responseMode !== 'direct-callback') return false;
 
   const channel = normalizeCallbackChannel(task.callbackChannel) || normalizeCallbackChannel(DEFAULT_CALLBACK_CHANNEL);
-  if (!channel) return false;
+  if (!channel) {
+    appendEvent('callback.skipped', task, {
+      taskId: task.id,
+      taskStatus: task.status,
+      sessionId: result.metadata?.sessionId || task.sessionId || null,
+      details: { reason: 'no callbackChannel and no DEFAULT_CALLBACK_CHANNEL configured' },
+    });
+    return false;
+  }
 
   const botToken = callbackTokenForTask(task);
   if (!botToken) {
@@ -1217,7 +1225,7 @@ app.post('/files/edit', auth, (req, res) => {
 
 // [Cloud OpenClaw] Execute local Claude Code CLI
 app.post('/claude', auth, (req, res) => {
-  const { prompt, timeout = 120000, sessionId, model, callbackChannel, callbackBotToken } = req.body || {};
+  const { prompt, timeout = 600000, sessionId, model, callbackChannel, callbackBotToken } = req.body || {};
   const promptText = typeof prompt === 'string' ? prompt : '';
   const requestedSessionId = normalizeOptionalString(sessionId);
   const dispatchMeta = extractDispatchMeta(req.body, 'cc');
@@ -1231,7 +1239,7 @@ app.post('/claude', auth, (req, res) => {
   const task = enqueueTask({
     type: 'claude-cli',
     prompt: promptText,
-    timeout: parseTaskTimeout(timeout, 120000),
+    timeout: parseTaskTimeout(timeout, 600000),
     sessionId: effectiveSessionId,
     model: normalizeOptionalString(model),
     callbackChannel: normalizeOptionalString(callbackChannel),
@@ -1508,6 +1516,7 @@ const cleanupInterval = setInterval(() => {
       SELECT id
       FROM tasks
       WHERE id NOT IN (SELECT task_id FROM task_results)
+        AND status != 'running'
         AND created_at < ?
     `).all(now - TASK_EXPIRE_MS);
     for (const row of expiredTasks) {

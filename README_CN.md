@@ -16,9 +16,9 @@
 
 ---
 
-> **状态：维护模式。** 4-30 Hermes 切换后，OpenClaw 主路径已退役；
-> 本工具现仅服务 LanceDB Test bot 这一个剩余 OpenClaw 容器——它通过 task-api 通道
-> （在容器 workspace 的 `TOOLS.md` 里配置）访问 Mac 宿主机资源。
+> **状态：维护模式。** 作者自己的部署里，OpenClaw 插件的 slash 命令路径已退役；
+> 当前在用的是容器直接通过 HTTP 调用 task-api（见下方“两种接入方式”）。
+> 插件本身仍可用，对 OpenClaw 用户仍是推荐入口。
 
 ---
 
@@ -174,6 +174,25 @@ docker-compose up -d
 
 ---
 
+## 两种接入方式
+
+`task-api` 是一个标准 HTTP 服务，有两种驱动方式：
+
+**1. OpenClaw 插件（slash 命令）** — 把 `plugin/` 装进 OpenClaw 实例，聊天里用 `/cc`、`/codex`、`/gemini` 触发（见上方命令表）。适合 OpenClaw 用户。
+
+**2. 直接 HTTP** — 任意客户端（脚本、bot、其它 agent）可以直接 `POST /claude`，无需插件：
+
+```bash
+curl -X POST http://<task-api-host>:3456/claude \
+  -H "Authorization: Bearer $WORKER_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "你要 CC 做的事", "timeout": 600000, "callbackChannel": "<可选的回调频道ID>"}'
+```
+
+返回 `{ "taskId": "...", "sessionId": "..." }`。传了 `callbackChannel` 走异步回调推送；不传则用 `GET /tasks/<taskId>?wait=<ms>` 轮询拿结果。`/codex`、`/gemini` 用法相同。
+
+---
+
 <details>
 <summary><strong>配置说明</strong></summary>
 
@@ -190,7 +209,7 @@ docker-compose up -d
 | `CLAUDE_PATH` | runner | `claude` 二进制路径（默认 `claude`） |
 | `CODEX_PATH` | runner | `codex` 二进制路径（默认 `codex`） |
 | `GEMINI_PATH` | runner | `gemini` 二进制路径（默认 `gemini`） |
-| `CC_TIMEOUT` | runner | 单任务最大执行时间（默认 `1200000` ms） |
+| `CC_TIMEOUT` | runner | 任务未自带 timeout 时的兜底执行上限（默认 `1200000` ms） |
 | `CC_MODELS` | runner | 可选 Claude 模型列表，逗号分隔。留空表示使用 Claude Code 默认模型 |
 | `RUNNER_SESSION_CACHE_FILE` | runner | 可选 session cache 路径。留空使用系统临时目录 |
 | `CC_LOG_PATH` | runner | 可选 Claude live log 路径。留空使用系统临时目录 |

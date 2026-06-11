@@ -101,8 +101,8 @@ const CONFIG = {
   longPollWait: parseConfigInt(process.env.LONG_POLL_WAIT, 30000, 1000, 300000),
   // Max concurrent tasks
   maxConcurrent: parseConfigInt(process.env.MAX_CONCURRENT, 5, 1, 50),
-  // Command execution timeout (ms) - 10 min, accommodates slow Gemini/Codex tasks
-  defaultTimeout: 600000,
+  // Command execution timeout (ms) — fallback when a task omits its own timeout; honors CC_TIMEOUT, defaults to 10 min
+  defaultTimeout: parseConfigInt(process.env.CC_TIMEOUT, 600000, 1000),
   // OpenClaw Hooks callback config (notify bot after CC completes)
   openclawHooksUrl: process.env.OPENCLAW_HOOKS_URL || 'http://127.0.0.1:18791',
   openclawHooksToken: process.env.OPENCLAW_HOOKS_TOKEN || 'cc-callback-2026',

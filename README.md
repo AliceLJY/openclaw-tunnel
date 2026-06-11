@@ -16,9 +16,9 @@
 
 ---
 
-> **Status: Maintenance mode.** After the 4-30 Hermes migration the main OpenClaw path is retired;
-> this tool now serves just one remaining OpenClaw container — the LanceDB Test bot, which reaches
-> Mac host resources through the task-api channel (configured in the container's workspace `TOOLS.md`).
+> **Status: Maintenance mode.** In the author's own setup the OpenClaw plugin's slash-command path is
+> retired; the live path is now containers calling `task-api` directly over HTTP (see "Two Ways to
+> Connect" below). The plugin still works and remains the recommended entry point for OpenClaw users.
 
 ---
 
@@ -174,6 +174,25 @@ After setup, copy `plugin/` into your OpenClaw plugins folder (or reference it i
 
 ---
 
+## Two Ways to Connect
+
+`task-api` is a plain HTTP service. There are two ways to drive it:
+
+**1. OpenClaw plugin (slash commands)** — install `plugin/` into an OpenClaw instance and trigger `/cc`, `/codex`, `/gemini` from chat (see the table above). Best for OpenClaw users.
+
+**2. Direct HTTP** — any client (a script, a bot, another agent) can `POST /claude` directly, no plugin required:
+
+```bash
+curl -X POST http://<task-api-host>:3456/claude \
+  -H "Authorization: Bearer $WORKER_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "what you want CC to do", "timeout": 600000, "callbackChannel": "<optional channel id>"}'
+```
+
+Response: `{ "taskId": "...", "sessionId": "..." }`. With `callbackChannel` the result is pushed back asynchronously; without it, poll `GET /tasks/<taskId>?wait=<ms>` for the result. `/codex` and `/gemini` work the same way.
+
+---
+
 <details>
 <summary><strong>Configuration</strong></summary>
 
@@ -190,7 +209,7 @@ Copy `.env.example` to `.env` (or let `setup.sh` generate it):
 | `CLAUDE_PATH` | runner | Path to `claude` binary (default: `claude`) |
 | `CODEX_PATH` | runner | Path to `codex` binary (default: `codex`) |
 | `GEMINI_PATH` | runner | Path to `gemini` binary (default: `gemini`) |
-| `CC_TIMEOUT` | runner | Max execution time per task in ms (default: `1200000`) |
+| `CC_TIMEOUT` | runner | Fallback per-task execution cap when a task omits its own timeout, in ms (default: `1200000`) |
 | `CC_MODELS` | runner | Optional comma-separated Claude model list. Empty means use Claude Code's default model |
 | `RUNNER_SESSION_CACHE_FILE` | runner | Optional session cache path. Empty uses the OS temp directory |
 | `CC_LOG_PATH` | runner | Optional Claude live log path. Empty uses the OS temp directory |
