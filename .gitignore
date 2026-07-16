@@ -1,4 +1,5 @@
 .env
+.runtime/
 node_modules/
 dist/
 *.db

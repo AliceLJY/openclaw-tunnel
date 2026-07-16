@@ -4,7 +4,7 @@
 
 **Run AI Coding Agents from Anywhere — Docker, Cloud, or Hybrid**
 
-*An HTTP task-queue bridge that lets OpenClaw dispatch tasks to Claude Code, Codex, and Gemini CLI across container boundaries, network boundaries, or both.*
+*An authenticated HTTP(S) task-queue bridge that lets OpenClaw dispatch tasks to Claude Code, Codex, and Gemini CLI across container boundaries, network boundaries, or both.*
 
 [![MIT License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Node.js](https://img.shields.io/badge/Node.js-≥22.5-339933?logo=node.js)](https://nodejs.org)
@@ -17,8 +17,9 @@
 ---
 
 > **Status: Maintenance mode.** In the author's own setup the OpenClaw plugin's slash-command path is
-> retired; the live path is now containers calling `task-api` directly over HTTP (see "Two Ways to
-> Connect" below). The plugin still works and remains the recommended entry point for OpenClaw users.
+> retired; the live path is now containers calling `task-api` directly over a local/private network
+> (see "Two Ways to Connect" below). The plugin still works and remains the recommended entry point
+> for OpenClaw users.
 
 ---
 
@@ -28,11 +29,11 @@
 
 **The problem:** when OpenClaw runs in Docker or on a remote server, acpx cannot reach a CLI on another machine. ACP is a stdio protocol with no network transport. Remote ACP is still "work in progress" in the spec.
 
-**What tunnel does:** instead of waiting for remote ACP, tunnel bridges the gap with an HTTP task queue. The plugin (inside Docker) enqueues tasks to `task-api`. A runner anywhere on the network long-polls for tasks, spawns the CLI, and reports the result back to `task-api`, which posts it to your chat channel.
+**What tunnel does:** instead of waiting for remote ACP, tunnel bridges the gap with an authenticated HTTP(S) task queue. The plugin (inside Docker) enqueues tasks to `task-api`. A runner on the same host or a trusted, encrypted network long-polls for tasks, spawns the CLI, and reports the result back to `task-api`, which posts it to your chat channel.
 
 | | acpx | tunnel |
 |---|---|---|
-| Protocol | ACP (JSON-RPC over stdio) | HTTP task queue + server callback |
+| Protocol | ACP (JSON-RPC over stdio) | Authenticated HTTP(S) task queue + server callback |
 | Same machine required | Yes | No — works across networks |
 | Session model | By git directory | By chat channel |
 | Token cost | Zero (protocol layer) | Zero (protocol layer) |
@@ -69,28 +70,34 @@ OpenClaw + task-api in Docker on your machine. Runner on the host. Everything on
 WORKER_URL=http://localhost:3456
 ```
 
-### Scenario B: Cloud + Local Runner
+### Scenario B: Cloud + Local Runner *(encrypted transport required)*
 
 task-api on a cloud VM (AWS, GCP, any VPS). Runner on your local machine — your CLIs stay local, but orchestration lives in the cloud.
 
 ```
 ┌───── Cloud VM ──────┐           ┌────── Your Machine ──────┐
 │  Docker             │           │                           │
-│   OpenClaw + plugin │ internet  │  runner                   │
+│   OpenClaw + plugin │ HTTPS /   │  runner                   │
 │   task-api :3456    │◄──────────│  → Claude Code            │
-│                     │           │  → Codex                  │
+│                     │ VPN / SSH │  → Codex                  │
 └─────────────────────┘           │  → Gemini                 │
                                   └───────────────────────────┘
 ```
 
 ```bash
-# Runner connects to cloud server
-WORKER_URL=http://your-server.com:3456
+# Option 1: TLS reverse proxy in front of task-api
+WORKER_URL=https://task-api.example.com
+
+# Option 2: SSH tunnel; task-api stays bound to loopback on the VM
+ssh -N -L 3456:127.0.0.1:3456 user@task-api-host
+WORKER_URL=http://127.0.0.1:3456
 ```
+
+Tailscale or another VPN is also suitable when `task-api` is bound only to the VPN interface. Never send the bearer token, prompts, or results over plaintext public HTTP.
 
 ### Scenario C: Fully Remote
 
-Everything on cloud infrastructure. Ideal for compliance requirements — all AI agent execution contained within managed servers.
+Everything on managed cloud infrastructure. Keep `task-api` on loopback or a private network. This can support organizational deployment controls, but hosting location alone does not establish compliance.
 
 ```
 ┌────────────────── Cloud VM ──────────────────┐
@@ -123,10 +130,10 @@ WORKER_URL=http://localhost:3456
 | **Session continuity** | Per-channel sessions with auto-resume. Bindings persisted in SQLite |
 | **Zero-token relay** | Protocol layer only — no LLM calls in the plugin or runner |
 | **Platform agnostic** | Discord, Telegram, or any platform OpenClaw supports |
-| **One-command setup** | `setup.sh` generates `.env`, updates plugin config, installs LaunchAgent |
+| **Guided setup** | `setup.sh` writes ignored private runtime config and can install a LaunchAgent; plugin copy/config merge remains manual |
 | **Concurrent execution** | Up to 5 parallel tasks with configurable Claude model fallback |
 | **SDK + CLI modes** | Agent SDK (streaming) with automatic fallback to CLI |
-| **Cloud-ready** | Deploy anywhere — local Docker, cloud VM, or hybrid |
+| **Remote-capable** | Local Docker, cloud VM, or hybrid when protected by HTTPS, VPN, or SSH tunneling |
 
 ---
 
@@ -143,11 +150,11 @@ docker-compose up -d
 `setup.sh` will:
 1. Check prerequisites (Docker, Node.js, Claude Code CLI)
 2. Prompt for port, bot token, and callback channel
-3. Generate `WORKER_TOKEN` and write `.env`
-4. Update `plugin/openclaw.plugin.json` with your values
+3. Generate a 256-bit `WORKER_TOKEN` without displaying it and write the task-api `.env` plus scoped `.runtime/runner.env`, both ignored and mode `0600`
+4. Write an ignored private OpenClaw config snippet to `.runtime/openclaw-plugin-config.json` with mode `0600`; the callback bot token stays only in task-api `.env`
 5. Offer to install the macOS LaunchAgent for the runner
 
-After setup, copy `plugin/` into your OpenClaw plugins folder (or reference it in `openclaw.json`).
+After setup, copy `plugin/` into your OpenClaw plugins folder (or reference it in `openclaw.json`), then merge `.runtime/openclaw-plugin-config.json` into your existing private OpenClaw config. The tracked `plugin/openclaw.plugin.json` remains a schema-only manifest and never receives credentials.
 
 ---
 
@@ -176,14 +183,14 @@ After setup, copy `plugin/` into your OpenClaw plugins folder (or reference it i
 
 ## Two Ways to Connect
 
-`task-api` is a plain HTTP service. There are two ways to drive it:
+`task-api` exposes an authenticated HTTP API. Local loopback/private-Docker HTTP is supported; any remote path must use HTTPS, a VPN, or an SSH tunnel. There are two ways to drive it:
 
 **1. OpenClaw plugin (slash commands)** — install `plugin/` into an OpenClaw instance and trigger `/cc`, `/codex`, `/gemini` from chat (see the table above). Best for OpenClaw users.
 
-**2. Direct HTTP** — any client (a script, a bot, another agent) can `POST /claude` directly, no plugin required:
+**2. Direct API** — any trusted client (a script, a bot, another agent) can `POST /claude` directly, no plugin required. This remote example assumes a TLS reverse proxy:
 
 ```bash
-curl -X POST http://<task-api-host>:3456/claude \
+curl -X POST https://task-api.example.com/claude \
   -H "Authorization: Bearer $WORKER_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"prompt": "what you want CC to do", "timeout": 600000, "callbackChannel": "<optional channel id>"}'
@@ -193,15 +200,35 @@ Response: `{ "taskId": "...", "sessionId": "..." }`. With `callbackChannel` the 
 
 ---
 
+## Security and Trust Boundary
+
+This project is a **trusted remote-execution bridge, not a sandbox**. Treat possession of `WORKER_TOKEN` as near-user-level access to the runner host:
+
+- An authenticated caller can enqueue shell commands, read/write/edit files within the runner's broad allowed roots, and invoke Claude Code, Codex, or Gemini.
+- The command prefix filter rejects some unsupported or obviously hazardous strings, but accepted commands still run as `/bin/zsh -l -c <command>` with the runner user's permissions. Prefix matching is not shell parsing, isolation, or hostile-user authorization.
+- The CLI paths intentionally use broad automation modes. A successful prompt injection or stolen bearer token can therefore have a blast radius close to the runner's user account.
+- The runner removes bridge-control secrets (`WORKER_TOKEN`, callback bot tokens, and hook tokens) from shell-command and AI-CLI child environments. This reduces accidental credential exposure; it does not make those child processes sandboxed.
+
+Transport and deployment rules:
+
+- Use plaintext HTTP only on loopback or an explicitly private Docker network.
+- For another host, use an HTTPS reverse proxy, a VPN/Tailscale connection bound to the private interface, or an SSH tunnel. `WORKER_TOKEN` authenticates requests; it does not encrypt prompts, results, or credentials.
+- Compose publishes `task-api` on `127.0.0.1` by default. For VPN access, set `TASK_API_BIND` to the specific VPN interface address—do not publish the port on a public wildcard address.
+- Keep `.env`, `.runtime/runner.env`, `.runtime/openclaw-plugin-config.json`, the OpenClaw config, task databases, and runner logs private. Rotate the worker token if either runner/plugin config is exposed; rotate the callback token if task-api `.env` is exposed.
+- A cloud or container deployment is not automatically compliant; evaluate identity, transport encryption, host hardening, retention, and provider data handling for your own requirements.
+
+---
+
 <details>
 <summary><strong>Configuration</strong></summary>
 
-Copy `.env.example` to `.env` (or let `setup.sh` generate it):
+Prefer `setup.sh`, which creates separate task-api and runner files so the callback bot token is not inherited by runner child processes. For manual setup, `.env.example` documents all variables and `runner/runtime-config.example` is the scoped runner template.
 
 | Variable | Where used | Description |
 |---|---|---|
-| `WORKER_TOKEN` | task-api + runner | Shared secret for API auth (min 16 chars) |
+| `WORKER_TOKEN` | task-api + runner | Shared secret for API auth (min 16 chars; setup generates 256 random bits) |
 | `PORT` | task-api | Port task-api listens on (default: `3456`) |
+| `TASK_API_BIND` | Docker Compose | Host interface for the published port (default: `127.0.0.1`; use a specific VPN address for VPN access) |
 | `CALLBACK_BOT_TOKEN` | task-api | Bot token for posting results back |
 | `CALLBACK_API_BASE_URL` | task-api | Bot API base URL (default: Discord) |
 | `CALLBACK_CHANNEL` | task-api | Optional fallback channel/thread ID when a task has no callback channel |
@@ -219,30 +246,28 @@ Copy `.env.example` to `.env` (or let `setup.sh` generate it):
 | `WORKER_DIRECT_CALLBACK` | runner | Legacy opt-in for runner-side callback delivery. Keep `false` for Windows/cloud setups |
 | `DISCORD_PROXY` | runner | HTTPS proxy for legacy runner-side callback delivery (optional) |
 
-The plugin reads `apiUrl`, `apiToken`, and `callbackChannel` from `plugin/openclaw.plugin.json` — `setup.sh` populates these automatically.
+The tracked `plugin/openclaw.plugin.json` defines only the plugin schema. Runtime values belong under `plugins.entries.cli-bridge.config` in your private OpenClaw config. `setup.sh` generates the correctly shaped, ignored snippet at `.runtime/openclaw-plugin-config.json` with the worker API token and callback channel. The optional `callbackBotToken` schema remains available for legacy/manual deployments, but setup deliberately keeps that token in task-api `.env` and does not copy it to the plugin or runner.
 
 </details>
 
 <details>
 <summary><strong>Runner on Linux / Cloud</strong></summary>
 
-`setup.sh` installs a macOS LaunchAgent automatically. On Linux or cloud VMs, run the runner manually:
+`setup.sh` offers to install a macOS LaunchAgent. On Linux or cloud VMs, run the runner manually:
 
 ```bash
 cd runner
-WORKER_URL=http://localhost:3456 WORKER_TOKEN=your-token node worker.js
+node --env-file=../.runtime/runner.env worker.js
 ```
 
 On Windows, run:
 
 ```bat
 cd runner
-set "WORKER_URL=http://your-server:3456"
-set "WORKER_TOKEN=your-token"
-start-worker.bat
+node --env-file=..\.runtime\runner.env worker.js
 ```
 
-The Windows launcher uses `%TEMP%` for the session cache and live log by default. Leave `WORKER_DIRECT_CALLBACK=false` so Windows only reports results to `task-api`; the server sends the chat callback.
+The runner uses `%TEMP%` for the session cache and live log by default on Windows. Leave `WORKER_DIRECT_CALLBACK=false` so Windows only reports results to `task-api`; the server sends the chat callback.
 
 Or register as a systemd service for always-on operation:
 
@@ -252,23 +277,22 @@ Description=openclaw-tunnel runner
 After=network.target
 
 [Service]
+EnvironmentFile=/path/to/openclaw-tunnel/.runtime/runner.env
 ExecStart=/usr/bin/node /path/to/runner/worker.js
-Environment=WORKER_URL=http://localhost:3456
-Environment=WORKER_TOKEN=your-token
 Restart=always
 
 [Install]
 WantedBy=multi-user.target
 ```
 
-For cloud deployment (Scenario B), replace `localhost` with the cloud server's IP or domain.
+For Scenario B, set `WORKER_URL` in the private `.runtime/runner.env` to an HTTPS endpoint, or keep the loopback URL and establish the documented SSH tunnel. For VPN access, use only the VPN address/interface.
 
 </details>
 
 <details>
 <summary><strong>Why long-polling?</strong></summary>
 
-The runner sits on the host (or a remote machine) behind NAT — `task-api` inside Docker cannot push to it. Rather than requiring the runner to expose a port or set up a reverse tunnel, the runner holds an open HTTP connection to `task-api` waiting for work. When a task arrives, `task-api` responds immediately. No inbound firewall rules, no WebSocket server, and the runner works identically on macOS, Linux, localhost, or across the internet.
+The runner sits on the host (or a remote machine) behind NAT — `task-api` inside Docker cannot push to it. Rather than requiring the runner to expose a port, the runner holds an outbound long-poll connection to `task-api` waiting for work. When a task arrives, `task-api` responds immediately. No inbound runner port or WebSocket server is needed; the same flow works on localhost and across an encrypted remote transport.
 
 </details>
 

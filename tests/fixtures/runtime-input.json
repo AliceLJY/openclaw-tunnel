@@ -1,0 +1,9 @@
+{
+  "PORT": "4567",
+  "TASK_API_BIND": "127.0.0.1",
+  "CALLBACK_BOT_TOKEN": "fixture-callback-token-not-a-secret",
+  "CALLBACK_CHANNEL": "fixture-channel",
+  "CLAUDE_PATH": "/opt/Fixture Tools/claude",
+  "CODEX_PATH": "/opt/Fixture Tools/codex",
+  "GEMINI_PATH": "/opt/Fixture Tools/gemini"
+}

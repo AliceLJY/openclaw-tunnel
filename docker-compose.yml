@@ -2,12 +2,14 @@
 #
 # Deployment scenarios:
 #   A) Local:  task-api in Docker on your machine, runner on the host (default)
-#   B) Cloud:  task-api on a cloud VM, runner on a separate machine
-#              Set WORKER_URL on runner to http://<cloud-ip>:3456
-#   C) Remote: Everything on cloud VMs — full compliance with container policies
+#   B) Cloud:  task-api on a cloud VM, runner connects through HTTPS, a VPN,
+#              or an SSH tunnel. Never expose this port as plaintext public HTTP.
+#   C) Remote: Keep task-api on loopback or a private network. Hosting location
+#              alone does not establish compliance.
 #
-# Security: WORKER_TOKEN authenticates all runner<->task-api communication.
-# For cloud deployment, restrict port access via firewall or reverse proxy.
+# Security: WORKER_TOKEN authenticates requests but does not encrypt traffic.
+# For remote deployment, use a TLS reverse proxy, VPN bind, or SSH tunnel.
+# A firewall is defense in depth, not transport encryption.
 
 services:
   task-api:
@@ -15,8 +17,8 @@ services:
       context: ./task-api
       dockerfile: Dockerfile
     ports:
-      # Expose to 0.0.0.0 for remote runner access; lock down with firewall in production
-      - "${PORT:-3456}:${PORT:-3456}"
+      # Loopback by default. For VPN access, bind TASK_API_BIND to the VPN interface only.
+      - "${TASK_API_BIND:-127.0.0.1}:${PORT:-3456}:${PORT:-3456}"
     environment:
       - WORKER_TOKEN=${WORKER_TOKEN}
       - PORT=${PORT:-3456}

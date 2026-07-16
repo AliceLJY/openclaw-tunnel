@@ -3,16 +3,16 @@
 
 FROM node:22-alpine
 
-# Install Docker CLI for callback (docker exec into bot containers)
-RUN apk add --no-cache docker-cli
-
 WORKDIR /app
 
-# Install dependencies
-COPY package.json ./
-RUN npm install --production
+# Install exactly the audited production dependency graph.
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
 
-# Copy application
+# Copy application. The image intentionally carries no Docker CLI/socket access.
+# Keep the existing container UID for compatibility with root-owned /data
+# volumes created by v1.1 and earlier; changing that requires an explicit data
+# ownership migration in a future major release.
 COPY server.js ./
 
 # Expose port

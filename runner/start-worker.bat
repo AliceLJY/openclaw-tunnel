@@ -7,6 +7,14 @@ rem Edit these values here, or set them in the environment before running this f
 
 cd /d "%~dp0"
 
+set "RUNTIME_ENV=%~dp0..\.runtime\runner.env"
+if exist "%RUNTIME_ENV%" (
+  echo Starting openclaw-tunnel runner with scoped runtime config
+  node "--env-file=%RUNTIME_ENV%" worker.js
+  if errorlevel 1 exit /b 1
+  exit /b 0
+)
+
 if "%WORKER_URL%"=="" set "WORKER_URL=http://127.0.0.1:3456"
 if "%CLAUDE_PATH%"=="" set "CLAUDE_PATH=claude"
 if "%CODEX_PATH%"=="" set "CODEX_PATH=codex"

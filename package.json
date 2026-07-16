@@ -1,0 +1,10 @@
+{
+  "name": "openclaw-tunnel-repository",
+  "version": "1.2.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test tests/*.test.mjs",
+    "check": "bash scripts/check.sh"
+  }
+}

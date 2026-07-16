@@ -1,5 +1,6 @@
 #!/bin/bash
 set -euo pipefail
+umask 077
 
 # openclaw-tunnel runner installer
 # Generates a macOS LaunchAgent for the runner process
@@ -9,28 +10,24 @@ PLIST_NAME="com.openclaw-tunnel.runner"
 PLIST_PATH="$HOME/Library/LaunchAgents/${PLIST_NAME}.plist"
 LOG_PATH="/tmp/openclaw-tunnel-runner.log"
 
-# Load .env from parent directory if exists
-ENV_FILE="${SCRIPT_DIR}/../.env"
-if [[ -f "$ENV_FILE" ]]; then
-  # shellcheck disable=SC1090
-  source "$ENV_FILE"
+# Keep credentials in the ignored private env file. The LaunchAgent receives only
+# its path; bearer and callback tokens are not copied into the plist.
+ENV_FILE="${OPENCLAW_TUNNEL_ENV_FILE:-${SCRIPT_DIR}/../.runtime/runner.env}"
+if [[ ! -f "$ENV_FILE" ]]; then
+  echo "❌ Private runtime config not found: ${ENV_FILE}"
+  echo "   Run setup.sh first or create it from runner/runtime-config.example."
+  exit 1
+fi
+chmod 600 "$ENV_FILE"
+
+NODE_PATH="$(command -v node 2>/dev/null || true)"
+if [[ -z "$NODE_PATH" ]]; then
+  echo "❌ Node.js not found in PATH."
+  exit 1
 fi
 
-# Resolve config
-WORKER_URL="${WORKER_URL:-http://localhost:3456}"
-WORKER_TOKEN="${WORKER_TOKEN:-}"
-CLAUDE_PATH="${CLAUDE_PATH:-claude}"
-CODEX_PATH="${CODEX_PATH:-codex}"
-GEMINI_PATH="${GEMINI_PATH:-gemini}"
-CC_TIMEOUT="${CC_TIMEOUT:-1200000}"
-CC_MODELS="${CC_MODELS:-}"
-RUNNER_SESSION_CACHE_FILE="${RUNNER_SESSION_CACHE_FILE:-}"
-CC_LOG_PATH="${CC_LOG_PATH:-}"
-WORKER_DIRECT_CALLBACK="${WORKER_DIRECT_CALLBACK:-false}"
-NODE_PATH="$(which node 2>/dev/null || echo "/usr/local/bin/node")"
-
-if [[ -z "$WORKER_TOKEN" ]]; then
-  echo "❌ WORKER_TOKEN not set. Run setup.sh first or set it in .env"
+if ! "$NODE_PATH" --env-file="$ENV_FILE" -e 'process.exit(process.env.WORKER_TOKEN ? 0 : 1)'; then
+  echo "❌ WORKER_TOKEN is empty in ${ENV_FILE}. Run setup.sh again."
   exit 1
 fi
 
@@ -39,7 +36,7 @@ if [[ "$(uname)" != "Darwin" ]]; then
   echo "⚠️  LaunchAgent is macOS only. On Linux, run manually:"
   echo ""
   echo "  cd ${SCRIPT_DIR}"
-  echo "  WORKER_URL=${WORKER_URL} WORKER_TOKEN=\$WORKER_TOKEN node worker.js"
+  echo "  node --env-file=${ENV_FILE} worker.js"
   echo ""
   echo "Or create a systemd unit — see README for an example."
   exit 0
@@ -56,37 +53,17 @@ cat > "$PLIST_PATH" <<PLIST
   <key>ProgramArguments</key>
   <array>
     <string>${NODE_PATH}</string>
+    <string>--env-file=${ENV_FILE}</string>
     <string>${SCRIPT_DIR}/worker.js</string>
   </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>WORKER_URL</key>
-    <string>${WORKER_URL}</string>
-    <key>WORKER_TOKEN</key>
-    <string>${WORKER_TOKEN}</string>
-    <key>CLAUDE_PATH</key>
-    <string>${CLAUDE_PATH}</string>
-    <key>CODEX_PATH</key>
-    <string>${CODEX_PATH}</string>
-    <key>GEMINI_PATH</key>
-    <string>${GEMINI_PATH}</string>
-    <key>CC_TIMEOUT</key>
-    <string>${CC_TIMEOUT}</string>
-    <key>CC_MODELS</key>
-    <string>${CC_MODELS}</string>
-    <key>RUNNER_SESSION_CACHE_FILE</key>
-    <string>${RUNNER_SESSION_CACHE_FILE}</string>
-    <key>CC_LOG_PATH</key>
-    <string>${CC_LOG_PATH}</string>
-    <key>WORKER_DIRECT_CALLBACK</key>
-    <string>${WORKER_DIRECT_CALLBACK}</string>
-  </dict>
   <key>WorkingDirectory</key>
   <string>${SCRIPT_DIR}</string>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
   <true/>
+  <key>Umask</key>
+  <integer>63</integer>
   <key>StandardOutPath</key>
   <string>${LOG_PATH}</string>
   <key>StandardErrorPath</key>
@@ -94,8 +71,10 @@ cat > "$PLIST_PATH" <<PLIST
 </dict>
 </plist>
 PLIST
+chmod 600 "$PLIST_PATH"
 
 echo "✅ LaunchAgent written to ${PLIST_PATH}"
+echo "   Credentials remain in ${ENV_FILE}; the plist stores only that file path."
 echo ""
 echo "To start:"
 echo "  launchctl load ${PLIST_PATH}"

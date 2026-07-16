@@ -4,7 +4,7 @@
 
 **随时随地运行 AI 编程 Agent — Docker、云端、混合部署**
 
-*基于 HTTP 任务队列的桥接方案，让 OpenClaw 跨容器边界、跨网络边界调度 Claude Code、Codex 和 Gemini CLI。*
+*基于带认证的 HTTP(S) 任务队列，让 OpenClaw 跨容器边界、跨网络边界调度 Claude Code、Codex 和 Gemini CLI。*
 
 [![MIT License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Node.js](https://img.shields.io/badge/Node.js-≥22.5-339933?logo=node.js)](https://nodejs.org)
@@ -17,7 +17,7 @@
 ---
 
 > **状态：维护模式。** 作者自己的部署里，OpenClaw 插件的 slash 命令路径已退役；
-> 当前在用的是容器直接通过 HTTP 调用 task-api（见下方“两种接入方式”）。
+> 当前在用的是容器通过本机/私有网络直接调用 task-api（见下方“两种接入方式”）。
 > 插件本身仍可用，对 OpenClaw 用户仍是推荐入口。
 
 ---
@@ -28,11 +28,11 @@
 
 **问题在哪：** OpenClaw 跑在 Docker 或远程服务器上时，acpx 够不到另一台机器上的 CLI。ACP 是 stdio 协议，没有网络传输层。远程 ACP 在协议规范里还标着"work in progress"。
 
-**tunnel 怎么解决：** 不等远程 ACP 落地，直接用 HTTP 任务队列绕过去。插件（Docker 内）把任务推到 task-api，网络上任意位置的 runner 长轮询拉取任务，spawn CLI，再把结果回传给 task-api，由服务端推回聊天频道。
+**tunnel 怎么解决：** 不等远程 ACP 落地，直接用带认证的 HTTP(S) 任务队列绕过去。插件（Docker 内）把任务推到 task-api，同机或可信加密网络内的 runner 长轮询拉取任务，spawn CLI，再把结果回传给 task-api，由服务端推回聊天频道。
 
 | | acpx | tunnel |
 |---|---|---|
-| 协议 | ACP（stdio JSON-RPC） | HTTP 任务队列 + 服务端 callback |
+| 协议 | ACP（stdio JSON-RPC） | 带认证的 HTTP(S) 任务队列 + 服务端 callback |
 | 需要同一台机器 | 是 | 不需要 — 跨网络可用 |
 | 会话模型 | 按 git 目录绑定 | 按聊天频道绑定 |
 | token 消耗 | 零（协议层） | 零（协议层） |
@@ -69,28 +69,34 @@ OpenClaw + task-api 在本机 Docker 里，runner 在宿主机上。一台机器
 WORKER_URL=http://localhost:3456
 ```
 
-### 场景 B：云端 + 本地 Runner
+### 场景 B：云端 + 本地 Runner（必须加密传输）
 
 task-api 部署在云端服务器（AWS、GCP 或任意 VPS），runner 在本地 — CLI 留在身边，编排交给云端。
 
 ```
 ┌───── 云端服务器 ────┐           ┌────── 你的机器 ──────────┐
 │  Docker             │           │                           │
-│   OpenClaw + plugin │  互联网    │  runner                   │
+│   OpenClaw + plugin │ HTTPS /   │  runner                   │
 │   task-api :3456    │◄──────────│  → Claude Code            │
-│                     │           │  → Codex                  │
+│                     │ VPN / SSH │  → Codex                  │
 └─────────────────────┘           │  → Gemini                 │
                                   └───────────────────────────┘
 ```
 
 ```bash
-# runner 连云端服务器
-WORKER_URL=http://your-server.com:3456
+# 方案 1：在 task-api 前放 TLS 反向代理
+WORKER_URL=https://task-api.example.com
+
+# 方案 2：SSH 隧道；云端 task-api 仍只绑定 loopback
+ssh -N -L 3456:127.0.0.1:3456 user@task-api-host
+WORKER_URL=http://127.0.0.1:3456
 ```
+
+也可以使用 Tailscale 或其它 VPN，但 `task-api` 只能绑定到 VPN 接口。绝不能让 bearer token、prompt 或结果通过公网明文 HTTP 传输。
 
 ### 场景 C：全部远程
 
-所有组件都在云端。符合容器化/云端部署的合规要求 — AI Agent 执行全程在托管服务器内完成。
+所有组件都在托管云环境，`task-api` 仍应只走 loopback 或私有网络。这种部署可以配合单位的管控要求，但“放在云端”本身不等于合规。
 
 ```
 ┌────────────────── 云端服务器 ─────────────────┐
@@ -123,10 +129,10 @@ WORKER_URL=http://localhost:3456
 | **会话延续** | 按频道自动续接，绑定持久化到 SQLite |
 | **零 token 中转** | 纯协议层，不消耗 OpenClaw token 配额 |
 | **平台无关** | Discord、Telegram 或任何 OpenClaw 支持的平台 |
-| **一键配置** | `setup.sh` 生成 `.env`、更新插件配置、安装 LaunchAgent |
+| **引导式配置** | `setup.sh` 生成被 Git 忽略的私有运行时配置，并可安装 LaunchAgent；plugin 复制与配置合并仍需手工完成 |
 | **并发执行** | 最多 5 个并行任务，可配置 Claude 模型降级 |
 | **SDK + CLI 双模式** | 优先用 Agent SDK（流式输出），失败自动回退到 CLI |
-| **云端就绪** | 本地 Docker、云端 VM、混合部署，随你选 |
+| **支持远程** | 可本地 Docker、云端 VM 或混合部署；远程链路必须走 HTTPS、VPN 或 SSH 隧道 |
 
 ---
 
@@ -143,11 +149,11 @@ docker-compose up -d
 `setup.sh` 会：
 1. 检查前置条件（Docker、Node.js、Claude Code CLI）
 2. 提示输入端口、Bot Token、回调频道 ID
-3. 生成 `WORKER_TOKEN` 并写入 `.env`
-4. 更新 `plugin/openclaw.plugin.json`
+3. 生成 256-bit `WORKER_TOKEN`，不在终端显示；分别写入 task-api `.env` 和权限收窄的 `.runtime/runner.env`，两者都被 Git 忽略且权限为 `0600`
+4. 生成权限为 `0600` 的 Git 忽略配置片段 `.runtime/openclaw-plugin-config.json`；callback bot token 只留在 task-api `.env`
 5. 可选安装 macOS LaunchAgent
 
-配置完成后，把 `plugin/` 目录复制到 OpenClaw 插件目录（或在 `openclaw.json` 里引用）。
+配置完成后，把 `plugin/` 目录复制到 OpenClaw 插件目录（或在 `openclaw.json` 里引用），再把 `.runtime/openclaw-plugin-config.json` 合并进现有的 OpenClaw 私有配置。受 Git 跟踪的 `plugin/openclaw.plugin.json` 只保留 schema，不再写任何凭证。
 
 ---
 
@@ -176,14 +182,14 @@ docker-compose up -d
 
 ## 两种接入方式
 
-`task-api` 是一个标准 HTTP 服务，有两种驱动方式：
+`task-api` 提供带认证的 HTTP API。本机 loopback / 私有 Docker 网络可以用 HTTP；跨主机必须使用 HTTPS、VPN 或 SSH 隧道。有两种驱动方式：
 
 **1. OpenClaw 插件（slash 命令）** — 把 `plugin/` 装进 OpenClaw 实例，聊天里用 `/cc`、`/codex`、`/gemini` 触发（见上方命令表）。适合 OpenClaw 用户。
 
-**2. 直接 HTTP** — 任意客户端（脚本、bot、其它 agent）可以直接 `POST /claude`，无需插件：
+**2. 直接 API** — 可信客户端（脚本、bot、其它 agent）可以直接 `POST /claude`，无需插件。下面的远程示例假定前面已有 TLS 反向代理：
 
 ```bash
-curl -X POST http://<task-api-host>:3456/claude \
+curl -X POST https://task-api.example.com/claude \
   -H "Authorization: Bearer $WORKER_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"prompt": "你要 CC 做的事", "timeout": 600000, "callbackChannel": "<可选的回调频道ID>"}'
@@ -193,15 +199,35 @@ curl -X POST http://<task-api-host>:3456/claude \
 
 ---
 
+## 安全与信任边界
+
+这个项目是**可信远程执行桥，不是沙箱**。拿到 `WORKER_TOKEN`，就应视为拿到了接近 runner 宿主机当前用户权限的能力：
+
+- 通过认证的调用方可以提交 shell 命令、在 runner 的宽泛允许目录内读写/编辑文件，并调用 Claude Code、Codex 或 Gemini。
+- 命令前缀过滤器会挡住一部分不支持或明显危险的字符串，但通过后仍由 `/bin/zsh -l -c <command>` 以 runner 用户身份解释执行。前缀匹配不是 shell 解析、隔离机制，也不能承担恶意用户鉴权。
+- 三个 CLI 路径有意使用较宽的自动执行模式。若 prompt injection 成功或 bearer token 被盗，影响范围会接近 runner 用户账号本身。
+- runner 会从 shell 命令和 AI CLI 子进程环境中移除 `WORKER_TOKEN`、callback bot token 和 hook token。这能减少凭证意外暴露，但不等于给子进程加了沙箱。
+
+传输与部署规则：
+
+- 明文 HTTP 只用于 loopback 或明确的私有 Docker 网络。
+- 跨主机必须使用 HTTPS 反向代理、绑定私有接口的 VPN/Tailscale，或 SSH 隧道。`WORKER_TOKEN` 只能认证请求，不能加密 prompt、结果或凭证。
+- Compose 默认只把 `task-api` 发布到 `127.0.0.1`。VPN 场景把 `TASK_API_BIND` 设为具体 VPN 接口地址，不要发布到公网通配地址。
+- `.env`、`.runtime/runner.env`、`.runtime/openclaw-plugin-config.json`、OpenClaw 配置、任务数据库和 runner 日志都应保持私有。runner/plugin 配置暴露时轮换 worker token；task-api `.env` 暴露时再同时轮换 callback token。
+- 云端或容器化不自动等于合规；仍需按实际要求核对身份、传输加密、宿主机防护、留存和模型供应商的数据处理。
+
+---
+
 <details>
 <summary><strong>配置说明</strong></summary>
 
-`setup.sh` 生成的 `.env` 文件：
+优先使用 `setup.sh`，它会拆分 task-api 与 runner 配置，避免 callback bot token 被 runner 子进程继承。手工配置时，`.env.example` 列出全部变量，`runner/runtime-config.example` 是权限收窄的 runner 模板。
 
 | 变量 | 使用位置 | 说明 |
 |------|---------|------|
-| `WORKER_TOKEN` | task-api + runner | 共享认证密钥（≥16 字符） |
+| `WORKER_TOKEN` | task-api + runner | 共享认证密钥（≥16 字符；setup 默认生成 256-bit 随机值） |
 | `PORT` | task-api | 监听端口（默认 `3456`） |
+| `TASK_API_BIND` | Docker Compose | 宿主机发布接口（默认 `127.0.0.1`；VPN 场景填具体 VPN 地址） |
 | `CALLBACK_BOT_TOKEN` | task-api | 用于推送结果的 Bot Token |
 | `CALLBACK_API_BASE_URL` | task-api | Bot API 地址（默认 Discord） |
 | `CALLBACK_CHANNEL` | task-api | 可选兜底频道/子区 ID，任务没有 callbackChannel 时使用 |
@@ -219,30 +245,28 @@ curl -X POST http://<task-api-host>:3456/claude \
 | `WORKER_DIRECT_CALLBACK` | runner | 旧路径开关：是否让 runner 直接调用 callback API。Windows / 云端部署保持 `false` |
 | `DISCORD_PROXY` | runner | 旧路径的 HTTPS 代理（可选） |
 
-plugin 的配置在 `plugin/openclaw.plugin.json` 的 `config` 字段里，`setup.sh` 自动写入。
+受 Git 跟踪的 `plugin/openclaw.plugin.json` 只定义 schema。运行时配置应放在私有 OpenClaw 配置的 `plugins.entries.cli-bridge.config` 下。`setup.sh` 生成的 `.runtime/openclaw-plugin-config.json` 只含 worker API token 与 callback channel。schema 仍保留可选 `callbackBotToken` 供旧版/手工部署使用，但 setup 不会把它复制到 plugin 或 runner。
 
 </details>
 
 <details>
 <summary><strong>Linux / 云端运行</strong></summary>
 
-macOS 用 LaunchAgent 自启。Linux 或云端服务器手动运行：
+`setup.sh` 可选安装 macOS LaunchAgent。Linux 或云端服务器手动运行：
 
 ```bash
 cd runner
-WORKER_URL=http://localhost:3456 WORKER_TOKEN=你的token node worker.js
+node --env-file=../.runtime/runner.env worker.js
 ```
 
 Windows 上可以直接运行：
 
 ```bat
 cd runner
-set "WORKER_URL=http://your-server:3456"
-set "WORKER_TOKEN=你的token"
-start-worker.bat
+node --env-file=..\.runtime\runner.env worker.js
 ```
 
-Windows 启动脚本默认用 `%TEMP%` 保存 session cache 和 live log。保持 `WORKER_DIRECT_CALLBACK=false`，让 Windows 只把结果回传给 task-api，由服务端负责推送聊天 callback。
+runner 在 Windows 上默认用 `%TEMP%` 保存 session cache 和 live log。保持 `WORKER_DIRECT_CALLBACK=false`，让 Windows 只把结果回传给 task-api，由服务端负责推送聊天 callback。
 
 或配 systemd 持久运行：
 
@@ -252,23 +276,22 @@ Description=openclaw-tunnel runner
 After=network.target
 
 [Service]
+EnvironmentFile=/path/to/openclaw-tunnel/.runtime/runner.env
 ExecStart=/usr/bin/node /path/to/runner/worker.js
-Environment=WORKER_URL=http://localhost:3456
-Environment=WORKER_TOKEN=你的token
 Restart=always
 
 [Install]
 WantedBy=multi-user.target
 ```
 
-部署场景 B（云端 + 本地 Runner）时，把 `localhost` 换成云端服务器的 IP 或域名。
+部署场景 B 时，在私有 `.runtime/runner.env` 中把 `WORKER_URL` 设为 HTTPS 地址；或者保留 loopback 地址并建立前文的 SSH 隧道。VPN 场景只使用 VPN 地址/接口。
 
 </details>
 
 <details>
 <summary><strong>为什么用长轮询？</strong></summary>
 
-runner 在宿主机或远程机器上，可能在 NAT 后面，task-api 没法主动推送。与其让 runner 暴露端口或搞反向隧道，runner 直接 hold 一个 HTTP 连接等待任务——有任务立刻返回，没任务 30 秒超时后重连。效果接近推送，实现只需要普通 HTTP。不管是本机、局域网还是跨互联网，runner 的行为完全一致。
+runner 在宿主机或远程机器上，可能在 NAT 后面，task-api 没法主动推送。与其让 runner 暴露端口，runner 主动维持一个长轮询连接等待任务——有任务立刻返回，没任务 30 秒超时后重连。不需要开放 runner 入站端口或 WebSocket；同一套流程可用于本机，也可承载在加密的远程链路上。
 
 </details>
 

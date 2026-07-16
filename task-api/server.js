@@ -63,6 +63,13 @@ function parseBearerToken(headerValue) {
   return match ? match[1].trim() : '';
 }
 
+function tokenMatches(received, expected) {
+  const receivedBytes = Buffer.from(received);
+  const expectedBytes = Buffer.from(expected);
+  return receivedBytes.length === expectedBytes.length
+    && crypto.timingSafeEqual(receivedBytes, expectedBytes);
+}
+
 function parseBoundedInt(value, fallback, { min = 0, max = Number.MAX_SAFE_INTEGER } = {}) {
   const parsed = Number.parseInt(String(value ?? ''), 10);
   if (!Number.isFinite(parsed)) return fallback;
@@ -882,7 +889,7 @@ async function extractSessionTopic(filePath, fs, readline, resolver) {
 
 function auth(req, res, next) {
   const token = parseBearerToken(req.headers['authorization']);
-  if (token !== AUTH_TOKEN) {
+  if (!tokenMatches(token, AUTH_TOKEN)) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
   next();

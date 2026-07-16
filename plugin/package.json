@@ -24,7 +24,7 @@
     "extensions": ["./index.ts"]
   },
   "scripts": {
-    "test": "bun test",
+    "test": "node --test ../tests/*.test.mjs",
     "doctor": "bash scripts/doctor.sh"
   },
   "devDependencies": {

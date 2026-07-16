@@ -3,8 +3,8 @@
  * Host Runner / Reconciler
  * Agent SDK mode: streaming output + session management
  *
- * Run: npm run runner
- * Or: WORKER_URL=https://xxx WORKER_TOKEN=xxx npm run runner
+ * Run from runner/: node --env-file=../.runtime/runner.env worker.js
+ * For remote use, set an HTTPS/VPN/SSH-tunneled WORKER_URL in the private env file.
  */
 
 import { exec, spawn, execFile } from 'child_process';
@@ -14,6 +14,11 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { HttpsProxyAgent } from 'https-proxy-agent';
+import { buildSanitizedChildEnv } from './child-env.js';
+
+// Runner logs and session caches can contain prompts, results, and local paths.
+// Keep newly created files private even when the service manager's default umask is broad.
+process.umask(0o077);
 
 // Prevent nesting detection (needed when launched from within CC)
 delete process.env.CLAUDECODE;
@@ -103,9 +108,6 @@ const CONFIG = {
   maxConcurrent: parseConfigInt(process.env.MAX_CONCURRENT, 5, 1, 50),
   // Command execution timeout (ms) — fallback when a task omits its own timeout; honors CC_TIMEOUT, defaults to 10 min
   defaultTimeout: parseConfigInt(process.env.CC_TIMEOUT, 600000, 1000),
-  // OpenClaw Hooks callback config (notify bot after CC completes)
-  openclawHooksUrl: process.env.OPENCLAW_HOOKS_URL || 'http://127.0.0.1:18791',
-  openclawHooksToken: process.env.OPENCLAW_HOOKS_TOKEN || 'cc-callback-2026',
   callbackApiBaseUrl: process.env.CALLBACK_API_BASE_URL || 'https://discord.com/api/v10',
   // Runner local provider session cache, used only for local resume / mapping recovery
   runnerSessionCacheFile: process.env.RUNNER_SESSION_CACHE_FILE || defaultTempFile('openclaw-runner-session-cache.json'),
@@ -117,8 +119,9 @@ function redactToken(str) {
   return str.slice(0, 4) + '*'.repeat(Math.min(str.length - 4, 20));
 }
 
-if (CONFIG.token === 'change-me-to-a-secure-token') {
-  console.warn('WARNING: Using default WORKER_TOKEN. Set WORKER_TOKEN env var for production!');
+if (!CONFIG.token || CONFIG.token === 'change-me-to-a-secure-token' || CONFIG.token.length < 16) {
+  console.error('FATAL: WORKER_TOKEN is missing or too weak (minimum 16 characters; the default is rejected).');
+  process.exit(1);
 }
 
 console.log('========================================');
@@ -186,10 +189,12 @@ function request(method, urlPath, body = null) {
   });
 }
 
-// ========== Command validation ==========
-// Allowlist of command prefixes that the runner is permitted to execute.
-// Commands from Docker containers must start with one of these; anything else is rejected.
-const COMMAND_ALLOWLIST = [
+// ========== Command prefix filter ==========
+// This compatibility guard rejects unknown prefixes and a few hazardous patterns.
+// It is not a sandbox or a security boundary: accepted strings are interpreted by
+// zsh and run with the runner user's permissions. Only trusted token holders may
+// submit tasks to this runner.
+const COMMAND_PREFIX_FILTER = [
   'git ', 'npm ', 'node ', 'npx ', 'ls ', 'cat ', 'head ', 'tail ',
   'grep ', 'find ', 'wc ', 'echo ', 'pwd', 'date', 'which ', 'env',
   'docker ', 'docker-compose ', 'curl ', 'wget ',
@@ -203,7 +208,7 @@ const COMMAND_ALLOWLIST = [
   'tar ', 'zip ', 'unzip ', 'gzip ', 'gunzip ',
 ];
 
-function isCommandAllowed(command) {
+function passesCommandPrefixFilter(command) {
   const trimmed = command.trim();
   // Reject obviously dangerous patterns regardless of prefix
   const dangerousPatterns = [
@@ -217,13 +222,12 @@ function isCommandAllowed(command) {
   for (const pattern of dangerousPatterns) {
     if (pattern.test(trimmed)) return false;
   }
-  // Check allowlist
-  return COMMAND_ALLOWLIST.some(prefix => trimmed.startsWith(prefix) || trimmed === prefix.trim());
+  return COMMAND_PREFIX_FILTER.some(prefix => trimmed.startsWith(prefix) || trimmed === prefix.trim());
 }
 
 // ========== Execute command ==========
-// Uses spawn() with explicit args array to prevent shell injection.
-// Commands are validated against an allowlist before execution.
+// Accepted commands are trusted remote execution. The prefix filter is only a
+// coarse guard against accidental unsupported input; zsh still interprets them.
 function executeCommand(command, timeout) {
   return new Promise((resolve) => {
     const startTime = Date.now();
@@ -239,28 +243,26 @@ function executeCommand(command, timeout) {
       });
     }
 
-    if (!isCommandAllowed(cleanCommand)) {
-      console.warn(`[Command] BLOCKED: command not in allowlist: "${cleanCommand.slice(0, 80)}..."`);
+    if (!passesCommandPrefixFilter(cleanCommand)) {
+      console.warn(`[Command] BLOCKED by prefix filter: "${cleanCommand.slice(0, 80)}..."`);
       return resolve({
         stdout: '',
-        stderr: `Command not allowed. Must start with one of: ${COMMAND_ALLOWLIST.slice(0, 10).join(', ')}...`,
+        stderr: `Command rejected by prefix filter. Recognized prefixes include: ${COMMAND_PREFIX_FILTER.slice(0, 10).join(', ')}...`,
         exitCode: 126,
-        error: 'Command not in allowlist',
+        error: 'Command rejected by prefix filter',
         duration: 0
       });
     }
 
-    // Use spawn with shell args array instead of exec to prevent injection.
-    // The command is passed as a single -c argument string to /bin/zsh, which is safe
-    // because spawn does NOT invoke a shell layer on top -- it calls /bin/zsh directly.
+    // Deliberately invoke a login shell for compatibility with user CLI environments.
+    // zsh -c interprets the entire trusted command string, including shell syntax.
     const child = trackChildProcess(spawn('/bin/zsh', ['-l', '-c', cleanCommand], {
       timeout: timeout || CONFIG.defaultTimeout,
-      env: {
-        ...process.env,
+      env: buildSanitizedChildEnv(process.env, {
         PATH: process.env.PATH + ':/usr/local/bin:/opt/homebrew/bin',
         HOME: process.env.HOME,
         USER: process.env.USER
-      },
+      }),
       stdio: ['ignore', 'pipe', 'pipe'],
       maxBuffer: 10 * 1024 * 1024,
     }));
@@ -1172,12 +1174,11 @@ const GEMINI_PATH = process.env.GEMINI_PATH || 'gemini';
 const CC_LOG = process.env.CC_LOG_PATH || defaultTempFile('cc-live.log');
 
 function buildCliEnv(extra = {}) {
-  return {
-    ...process.env,
+  return buildSanitizedChildEnv(process.env, {
     PATH: '/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:' + process.env.PATH,
     HOME: process.env.HOME,
     ...extra,
-  };
+  });
 }
 
 function executeClaudeCLI(prompt, timeout, sessionId, model) {

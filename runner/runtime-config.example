@@ -1,0 +1,11 @@
+# Copy these non-secret placeholders to .runtime/runner.env and set mode 0600.
+WORKER_TOKEN=
+WORKER_URL=http://127.0.0.1:3456
+CLAUDE_PATH=claude
+CODEX_PATH=codex
+GEMINI_PATH=gemini
+CC_TIMEOUT=1200000
+CC_MODELS=
+RUNNER_SESSION_CACHE_FILE=
+CC_LOG_PATH=
+WORKER_DIRECT_CALLBACK=false
