@@ -28,6 +28,14 @@ services:
       - WORKER_TASK_DB=/data/tasks.db
     volumes:
       - tunnel-data:/data    # Persistent storage for task DB + event DB
+      - type: bind
+        source: ${CLAUDE_PROJECTS_DIR:?run setup.sh or set CLAUDE_PROJECTS_DIR}
+        target: /host-claude-projects
+        read_only: true
+      - type: bind
+        source: ${CODEX_SESSIONS_DIR:?run setup.sh or set CODEX_SESSIONS_DIR}
+        target: /host-codex-sessions
+        read_only: true
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:${PORT:-3456}/health"]

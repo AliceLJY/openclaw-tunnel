@@ -15,6 +15,13 @@ import path from 'path';
 import os from 'os';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import { buildSanitizedChildEnv } from './child-env.js';
+import {
+  buildExecutablePath,
+  listClaudeSessionFiles,
+  normalizeExitCode,
+  resolveCommandShell,
+  resolveRunnerHome,
+} from './runtime-platform.js';
 
 // Runner logs and session caches can contain prompts, results, and local paths.
 // Keep newly created files private even when the service manager's default umask is broad.
@@ -22,6 +29,8 @@ process.umask(0o077);
 
 // Prevent nesting detection (needed when launched from within CC)
 delete process.env.CLAUDECODE;
+
+const RUNNER_HOME = resolveRunnerHome();
 
 function parseConfigInt(value, fallback, min = 1, max = Number.MAX_SAFE_INTEGER) {
   const parsed = Number.parseInt(String(value ?? ''), 10);
@@ -192,7 +201,7 @@ function request(method, urlPath, body = null) {
 // ========== Command prefix filter ==========
 // This compatibility guard rejects unknown prefixes and a few hazardous patterns.
 // It is not a sandbox or a security boundary: accepted strings are interpreted by
-// zsh and run with the runner user's permissions. Only trusted token holders may
+// the configured host shell and run with the runner user's permissions. Only trusted token holders may
 // submit tasks to this runner.
 const COMMAND_PREFIX_FILTER = [
   'git ', 'npm ', 'node ', 'npx ', 'ls ', 'cat ', 'head ', 'tail ',
@@ -227,7 +236,7 @@ function passesCommandPrefixFilter(command) {
 
 // ========== Execute command ==========
 // Accepted commands are trusted remote execution. The prefix filter is only a
-// coarse guard against accidental unsupported input; zsh still interprets them.
+// coarse guard against accidental unsupported input; the host shell still interprets them.
 function executeCommand(command, timeout) {
   return new Promise((resolve) => {
     const startTime = Date.now();
@@ -254,13 +263,14 @@ function executeCommand(command, timeout) {
       });
     }
 
-    // Deliberately invoke a login shell for compatibility with user CLI environments.
-    // zsh -c interprets the entire trusted command string, including shell syntax.
-    const child = trackChildProcess(spawn('/bin/zsh', ['-l', '-c', cleanCommand], {
+    // Use the host platform's shell. Unix login shells preserve interactive CLI
+    // compatibility; Windows uses ComSpec/cmd.exe unless WORKER_SHELL overrides it.
+    const shell = resolveCommandShell(cleanCommand);
+    const child = trackChildProcess(spawn(shell.executable, shell.args, {
       timeout: timeout || CONFIG.defaultTimeout,
       env: buildSanitizedChildEnv(process.env, {
-        PATH: process.env.PATH + ':/usr/local/bin:/opt/homebrew/bin',
-        HOME: process.env.HOME,
+        PATH: buildExecutablePath(),
+        HOME: RUNNER_HOME,
         USER: process.env.USER
       }),
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -289,11 +299,12 @@ function executeCommand(command, timeout) {
     child.on('close', (code) => {
       clearTimeout(timer);
       const duration = Date.now() - startTime;
+      const exitCode = normalizeExitCode(code);
       resolve({
         stdout: stdout || '',
         stderr: stderr || '',
-        exitCode: code ?? 1,
-        error: code ? `Exit code ${code}` : null,
+        exitCode,
+        error: exitCode === 0 ? null : `Exit code ${exitCode}`,
         duration
       });
     });
@@ -314,14 +325,14 @@ function executeCommand(command, timeout) {
 // ========== File operations ==========
 function expandHome(filePath) {
   if (filePath.startsWith('~/')) {
-    return path.join(process.env.HOME, filePath.slice(2));
+    return path.join(RUNNER_HOME, filePath.slice(2));
   }
   return filePath;
 }
 
 // Path traversal guard: reject paths that escape $HOME via ../
 function isPathSafe(resolvedPath) {
-  const home = process.env.HOME;
+  const home = RUNNER_HOME;
   const normalized = path.resolve(resolvedPath);
   const allowedRoots = [home, os.tmpdir(), process.env.TMP, process.env.TEMP, '/tmp', '/var/tmp']
     .filter(Boolean)
@@ -335,7 +346,7 @@ function isPathSafe(resolvedPath) {
 }
 
 function allowedRootsMessage() {
-  return [process.env.HOME, os.tmpdir(), process.env.TMP, process.env.TEMP, '/tmp', '/var/tmp']
+  return [RUNNER_HOME, os.tmpdir(), process.env.TMP, process.env.TEMP, '/tmp', '/var/tmp']
     .filter(Boolean)
     .map((root) => path.resolve(expandHome(root)))
     .join(', ');
@@ -512,7 +523,7 @@ function rememberMappedSession(taskApiId, providerSessionId, callbackChannel) {
 }
 
 function listRecentCodexSessions(days = 30) {
-  const sessionsDir = path.join(process.env.HOME, '.codex', 'sessions');
+  const sessionsDir = process.env.CODEX_SESSIONS_DIR || path.join(RUNNER_HOME, '.codex', 'sessions');
   const sessionFiles = [];
   const now = new Date();
 
@@ -571,20 +582,16 @@ function resolveSessionPrefix(prefix) {
   // Already a full UUID (36 chars with hyphens, 32 chars hex) → return as-is
   if (prefix.length >= 32) return prefix;
 
-  const sessionDir = path.join(process.env.HOME, '.claude', 'projects', '-Users-' + path.basename(process.env.HOME));
+  const projectsRoot = process.env.CLAUDE_PROJECTS_DIR || path.join(RUNNER_HOME, '.claude', 'projects');
   try {
-    const files = fs.readdirSync(sessionDir);
-    const matches = files.filter(f => f.startsWith(prefix) && f.endsWith('.jsonl'));
+    const matches = listClaudeSessionFiles(prefix, { projectsRoot });
     if (matches.length === 1) {
-      const fullId = matches[0].replace('.jsonl', '');
+      const fullId = matches[0].sessionId;
       console.log(`[Session] Prefix match: ${prefix} → ${fullId}`);
       return fullId;
     } else if (matches.length > 1) {
       // Multiple matches → pick the most recently modified
-      const sorted = matches
-        .map(f => ({ file: f, mtime: fs.statSync(path.join(sessionDir, f)).mtimeMs }))
-        .sort((a, b) => b.mtime - a.mtime);
-      const fullId = sorted[0].file.replace('.jsonl', '');
+      const fullId = matches[0].sessionId;
       console.log(`[Session] Prefix ${prefix} matched ${matches.length} sessions, using latest: ${fullId}`);
       return fullId;
     }
@@ -798,19 +805,19 @@ async function executeClaudeSDK(prompt, timeout, sessionId, callbackChannel, mod
   // If so, resume it directly without going through sessionIdMap (avoids stale mapping override).
   let sdkSessionId = null;
   if (sessionId) {
-    const projectDir = path.join(process.env.HOME, '.claude', 'projects', '-Users-' + path.basename(process.env.HOME));
-    const sessionFile = path.join(projectDir, sessionId + '.jsonl');
-    if (fs.existsSync(sessionFile)) {
+    const projectsRoot = process.env.CLAUDE_PROJECTS_DIR || path.join(RUNNER_HOME, '.claude', 'projects');
+    const diskMatches = listClaudeSessionFiles(sessionId, { projectsRoot });
+    const exactDiskSession = diskMatches.find((match) => match.sessionId === sessionId);
+    if (exactDiskSession) {
       // Real CC session file exists → resume this terminal session directly
       sdkSessionId = sessionId;
     } else {
       // Exact file not found → try short ID prefix match first
       if (!sessionId.includes('-') || sessionId.length < 36) {
         try {
-          const matches = fs.readdirSync(projectDir)
-            .filter(f => f.startsWith(sessionId) && f.endsWith('.jsonl'));
+          const matches = diskMatches;
           if (matches.length === 1) {
-            sdkSessionId = matches[0].replace('.jsonl', '');
+            sdkSessionId = matches[0].sessionId;
             console.log(`[SDK] Short ID prefix match: ${sessionId} → ${sdkSessionId.slice(0, 8)}...`);
           } else if (matches.length > 1) {
             console.warn(`[SDK] Short ID ${sessionId} matched ${matches.length} sessions, skipping`);
@@ -867,7 +874,7 @@ async function executeClaudeSDK(prompt, timeout, sessionId, callbackChannel, mod
   const baseOptions = {
     permissionMode: 'bypassPermissions',
     allowDangerouslySkipPermissions: true,
-    cwd: process.env.HOME,
+    cwd: RUNNER_HOME,
   };
   if (selectedModel) baseOptions.model = selectedModel;
   const options = isResume
@@ -1005,7 +1012,7 @@ function executeCodexCLI(prompt, timeout, sessionId, model) {
     args.push(prompt);
 
     const child = trackChildProcess(spawn(CODEX_PATH, args, {
-      cwd: process.env.HOME,
+      cwd: RUNNER_HOME,
       env: buildCliEnv(),
       stdio: ['ignore', 'pipe', 'pipe']
     }));
@@ -1028,13 +1035,15 @@ function executeCodexCLI(prompt, timeout, sessionId, model) {
     child.on('close', (code) => {
       clearTimeout(timer);
       const duration = Date.now() - startTime;
+      const exitCode = normalizeExitCode(code);
       // Extract session id from stderr (format: session id: <uuid>)
       const sessionMatch = stderr.match(/session id:\s*([a-f0-9-]+)/i);
       const capturedSessionId = sessionMatch ? sessionMatch[1] : null;
       console.log(`[Codex CLI] Done, took ${duration}ms, output ${stdout.length} bytes${capturedSessionId ? ', session:' + capturedSessionId.slice(0, 8) : ''}`);
       resolve({
         stdout: stdout.trim(), stderr: stderr.trim(),
-        exitCode: code || 0, error: code ? `Exit code ${code}` : null, duration,
+        exitCode,
+        error: exitCode === 0 ? null : `Exit code ${exitCode}`, duration,
         metadata: capturedSessionId ? { sessionId: capturedSessionId } : undefined
       });
     });
@@ -1114,7 +1123,7 @@ function executeGeminiCLI(prompt, timeout, resumeLatest, model) {
     }
     args.push('-m', modelName, '-p', wrappedPrompt, '-o', 'json', '--sandbox=false');
     const child = trackChildProcess(spawn(GEMINI_PATH, args, {
-      cwd: process.env.HOME,
+      cwd: RUNNER_HOME,
       env: buildCliEnv(),
       stdio: ['ignore', 'pipe', 'pipe']
     }));
@@ -1137,6 +1146,7 @@ function executeGeminiCLI(prompt, timeout, resumeLatest, model) {
     child.on('close', (code) => {
       clearTimeout(timer);
       const duration = Date.now() - startTime;
+      const exitCode = normalizeExitCode(code);
       // Extract session_id and response from JSON output
       let capturedSessionId = null;
       let responseText = stdout.trim();
@@ -1152,7 +1162,8 @@ function executeGeminiCLI(prompt, timeout, resumeLatest, model) {
       console.log(`[Gemini CLI] Done, took ${duration}ms, output ${responseText.length} bytes${capturedSessionId ? ', session:' + capturedSessionId.slice(0, 8) : ''}`);
       resolve({
         stdout: responseText, stderr: stderr.trim(),
-        exitCode: code || 0, error: code ? `Exit code ${code}` : null, duration,
+        exitCode,
+        error: exitCode === 0 ? null : `Exit code ${exitCode}`, duration,
         metadata: capturedSessionId ? { sessionId: capturedSessionId } : undefined
       });
     });
@@ -1175,8 +1186,8 @@ const CC_LOG = process.env.CC_LOG_PATH || defaultTempFile('cc-live.log');
 
 function buildCliEnv(extra = {}) {
   return buildSanitizedChildEnv(process.env, {
-    PATH: '/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:' + process.env.PATH,
-    HOME: process.env.HOME,
+    PATH: buildExecutablePath(),
+    HOME: RUNNER_HOME,
     ...extra,
   });
 }
@@ -1203,7 +1214,7 @@ function executeClaudeCLI(prompt, timeout, sessionId, model) {
     // Write to live log
     try { fs.appendFileSync(CC_LOG, `\n${'='.repeat(60)}\n[${new Date().toISOString()}] CC started: ${prompt.slice(0, 80)}...\n${'='.repeat(60)}\n`); } catch (logErr) { console.warn(`[Claude CLI] Log write failed: ${logErr.message}`); }
     const child = trackChildProcess(spawn(CLAUDE_PATH, args, {
-      cwd: process.env.HOME,
+      cwd: RUNNER_HOME,
       env: buildCliEnv({ TERM: 'xterm-256color' }),
       stdio: ['ignore', 'pipe', 'pipe']
     }));
@@ -1236,6 +1247,7 @@ function executeClaudeCLI(prompt, timeout, sessionId, model) {
     child.on('close', (code) => {
       clearTimeout(timer);
       const duration = Date.now() - startTime;
+      const exitCode = normalizeExitCode(code);
       console.log(`[Claude CLI] Done, took ${duration}ms, output ${stdout.length} bytes`);
 
       try { fs.appendFileSync(CC_LOG, `\n[${new Date().toISOString()}] CC finished (${duration}ms, exit ${code})\n`); } catch (logErr) { /* non-critical log write */ }
@@ -1250,7 +1262,7 @@ function executeClaudeCLI(prompt, timeout, sessionId, model) {
       let ccSessionId = sessionId || null;
       if (!ccSessionId) {
         try {
-          const historyPath = path.join(process.env.HOME, '.claude', 'history.jsonl');
+          const historyPath = path.join(RUNNER_HOME, '.claude', 'history.jsonl');
           const lines = fs.readFileSync(historyPath, 'utf8').trim().split('\n');
           const lastEntry = JSON.parse(lines[lines.length - 1]);
           ccSessionId = lastEntry.sessionId || null;
@@ -1262,8 +1274,8 @@ function executeClaudeCLI(prompt, timeout, sessionId, model) {
       const result = {
         stdout: stdout.trim(),
         stderr: stderr.trim(),
-        exitCode: code || 0,
-        error: code ? `Exit code ${code}` : null,
+        exitCode,
+        error: exitCode === 0 ? null : `Exit code ${exitCode}`,
         duration
       };
 

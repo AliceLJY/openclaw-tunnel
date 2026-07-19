@@ -7,5 +7,6 @@ cd "$REPO_ROOT"
 bash -n setup.sh
 bash -n runner/install.sh
 node --check scripts/write-runtime-config.mjs
+node --check runner/runtime-platform.js
 node --check runner/worker.js
 node --check task-api/server.js

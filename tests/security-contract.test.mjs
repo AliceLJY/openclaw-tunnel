@@ -7,6 +7,13 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 import { buildSanitizedChildEnv, CONTROL_PLANE_SECRET_KEYS } from '../runner/child-env.js';
+import {
+  buildExecutablePath,
+  listClaudeSessionFiles,
+  normalizeExitCode,
+  resolveCommandShell,
+  resolveRunnerHome,
+} from '../runner/runtime-platform.js';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const runtimeWriter = path.join(repoRoot, 'scripts', 'write-runtime-config.mjs');
@@ -71,6 +78,10 @@ test('runtime writer keeps generated credentials private, unprinted, and ignored
   assert.equal(runnerEnvProbe.stdout, '', 'runner env validation must not print credentials');
   assert.equal(runnerEnvProbe.stderr, '', 'runner env validation must not print credentials');
   assert.equal(envValue(runnerEnvContents, 'WORKER_TOKEN'), generatedWorkerToken, 'runner and task API must share the worker token');
+  assert.ok(path.isAbsolute(envValue(envContents, 'CLAUDE_PROJECTS_DIR')), 'Compose must receive an absolute Claude session mount');
+  assert.ok(path.isAbsolute(envValue(envContents, 'CODEX_SESSIONS_DIR')), 'Compose must receive an absolute Codex session mount');
+  assert.equal(envValue(runnerEnvContents, 'CLAUDE_PROJECTS_DIR'), envValue(envContents, 'CLAUDE_PROJECTS_DIR'), 'runner and task-api must use the same Claude session root');
+  assert.equal(envValue(runnerEnvContents, 'CODEX_SESSIONS_DIR'), envValue(envContents, 'CODEX_SESSIONS_DIR'), 'runner and task-api must use the same Codex session root');
   assert.equal(result.stdout.includes(generatedWorkerToken), false, 'stdout must not disclose WORKER_TOKEN');
   assert.equal(result.stderr.includes(generatedWorkerToken), false, 'stderr must not disclose WORKER_TOKEN');
   assert.equal(generatedPluginValues.apiToken, generatedWorkerToken, 'plugin and task API must share the generated token');
@@ -135,6 +146,67 @@ test('child processes do not inherit bridge control-plane credentials', () => {
   assert.equal(childEnv.TERM, 'xterm-256color');
 });
 
+test('runner selects platform shells and preserves unknown child exit codes as failures', () => {
+  assert.deepEqual(
+    resolveCommandShell('node --version', {
+      platform: 'win32',
+      env: { ComSpec: 'C:\\Windows\\System32\\cmd.exe' },
+    }),
+    {
+      executable: 'C:\\Windows\\System32\\cmd.exe',
+      args: ['/d', '/s', '/c', 'node --version'],
+    },
+  );
+  assert.deepEqual(
+    resolveCommandShell('node --version', {
+      platform: 'win32',
+      env: { WORKER_SHELL: 'pwsh.exe' },
+    }),
+    {
+      executable: 'pwsh.exe',
+      args: ['-NoLogo', '-NoProfile', '-Command', 'node --version'],
+    },
+  );
+  assert.deepEqual(
+    resolveCommandShell('node --version', {
+      platform: 'linux',
+      env: { SHELL: '/bin/bash' },
+      existsSync: () => true,
+    }),
+    {
+      executable: '/bin/bash',
+      args: ['-l', '-c', 'node --version'],
+    },
+  );
+  assert.equal(buildExecutablePath({ Path: 'C:\\tools;C:\\Windows' }, 'win32'), 'C:\\tools;C:\\Windows');
+  assert.equal(buildExecutablePath({ PATH: '/custom/bin' }, 'linux').includes('/opt/homebrew/bin'), false);
+  assert.equal(resolveRunnerHome({ USERPROFILE: 'C:\\Users\\alice' }), 'C:\\Users\\alice');
+  assert.equal(normalizeExitCode(0), 0);
+  assert.equal(normalizeExitCode(7), 7);
+  assert.equal(normalizeExitCode(null), 1);
+  assert.equal(normalizeExitCode(undefined), 1);
+});
+
+test('Claude session lookup scans actual project directories instead of a macOS-only encoded home', () => {
+  const projectsRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'openclaw-tunnel-claude-sessions-'));
+  const linuxProject = path.join(projectsRoot, '-home-alice-project');
+  const otherProject = path.join(projectsRoot, '-work-repository');
+  fs.mkdirSync(linuxProject);
+  fs.mkdirSync(otherProject);
+  fs.writeFileSync(path.join(linuxProject, '12345678-aaaa-bbbb-cccc-123456789abc.jsonl'), '{}\n');
+  fs.writeFileSync(path.join(otherProject, '12345678-dddd-eeee-ffff-123456789abc.jsonl'), '{}\n');
+
+  const matches = listClaudeSessionFiles('12345678', { projectsRoot });
+  assert.equal(matches.length, 2);
+  assert.deepEqual(
+    new Set(matches.map((match) => match.sessionId)),
+    new Set([
+      '12345678-aaaa-bbbb-cccc-123456789abc',
+      '12345678-dddd-eeee-ffff-123456789abc',
+    ]),
+  );
+});
+
 test('documentation and Compose defaults require a protected remote transport', () => {
   const readme = readRepo('README.md');
   const readmeCn = readRepo('README_CN.md');
@@ -148,6 +220,8 @@ test('documentation and Compose defaults require a protected remote transport', 
   const combinedDocs = `${readme}\n${readmeCn}\n${compose}\n${envExample}`;
 
   assert.match(compose, /\$\{TASK_API_BIND:-127\.0\.0\.1\}:\$\{PORT:-3456\}/, 'Compose must publish on loopback by default');
+  assert.match(compose, /source: \$\{CLAUDE_PROJECTS_DIR:[^}]+\}[\s\S]*target: \/host-claude-projects[\s\S]*read_only: true/, 'Compose must require and mount Claude sessions read-only');
+  assert.match(compose, /source: \$\{CODEX_SESSIONS_DIR:[^}]+\}[\s\S]*target: \/host-codex-sessions[\s\S]*read_only: true/, 'Compose must require and mount Codex sessions read-only');
   assert.doesNotMatch(compose, /0\.0\.0\.0/, 'Compose must not publish task-api on every host interface by default');
   assert.doesNotMatch(combinedDocs, /http:\/\/(?:your-server(?:\.com)?|<task-api-host>|<cloud-ip>)/i, 'remote examples must not use plaintext public HTTP');
   assert.match(readme, /trusted remote-execution bridge, not a sandbox/i, 'English docs must state the execution trust boundary');
@@ -157,6 +231,12 @@ test('documentation and Compose defaults require a protected remote transport', 
   assert.match(worker, /It is not a sandbox or a security boundary/, 'runner source must not describe the prefix filter as isolation');
   assert.doesNotMatch(worker, /prevent shell injection/, 'runner source must not claim zsh -c prevents shell interpretation');
   assert.doesNotMatch(worker, /cc-callback-2026/, 'runner must not ship a hard-coded callback credential');
+  assert.doesNotMatch(worker, /exitCode: code \|\| 0/, 'unknown child exit codes must not be reported as success');
+  assert.doesNotMatch(worker, /spawn\(['"]\/bin\/zsh['"]/, 'runner command execution must not require macOS zsh');
+  assert.doesNotMatch(worker, /-Users-/, 'Claude session lookup must not assume a macOS home encoding');
+  const recoveryFunction = taskApi.match(/function preserveRunningTasksOnStartup\(\) \{[\s\S]*?\n\}/)?.[0] || '';
+  assert.match(recoveryFunction, /task\.recovery-preserved/, 'startup must record preserved running claims');
+  assert.doesNotMatch(recoveryFunction, /status\s*=\s*['"]pending['"]|saveTask\(/, 'startup must not requeue already-claimed tasks');
   assert.match(taskApi, /crypto\.timingSafeEqual/, 'task-api bearer comparison must use a timing-safe primitive');
   assert.match(dockerfile, /npm ci --omit=dev/, 'task-api image must install the audited lockfile exactly');
   assert.doesNotMatch(dockerfile, /docker-cli|docker\.sock/, 'task-api image must not carry unused Docker control-plane access');

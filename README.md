@@ -152,7 +152,8 @@ docker-compose up -d
 2. Prompt for port, bot token, and callback channel
 3. Generate a 256-bit `WORKER_TOKEN` without displaying it and write the task-api `.env` plus scoped `.runtime/runner.env`, both ignored and mode `0600`
 4. Write an ignored private OpenClaw config snippet to `.runtime/openclaw-plugin-config.json` with mode `0600`; the callback bot token stays only in task-api `.env`
-5. Offer to install the macOS LaunchAgent for the runner
+5. Detect the local Claude/Codex session directories and mount them read-only into task-api for recent-session commands
+6. Offer to install the macOS LaunchAgent for the runner
 
 After setup, copy `plugin/` into your OpenClaw plugins folder (or reference it in `openclaw.json`), then merge `.runtime/openclaw-plugin-config.json` into your existing private OpenClaw config. The tracked `plugin/openclaw.plugin.json` remains a schema-only manifest and never receives credentials.
 
@@ -165,6 +166,8 @@ After setup, copy `plugin/` into your OpenClaw plugins folder (or reference it i
 **`runner/`** — Node.js worker on the host (or any machine). Long-polls `task-api`, spawns Claude Code / Codex / Gemini CLI as child processes (up to 5 concurrent), and reports execution results back to `task-api`. Prefers Agent SDK with streaming, auto-fallback to CLI mode.
 
 **`plugin/`** — OpenClaw plugin (TypeScript). Registers `/cc`, `/codex`, `/gemini` command families, manages per-channel session bindings in SQLite, and submits tasks to `task-api`.
+
+If task-api restarts while a runner owns a task, the existing `running` claim is preserved. The server never requeues it automatically because the command may already have produced side effects. A surviving runner can still report the result; otherwise inspect the effects before submitting a replacement task.
 
 ---
 
@@ -205,7 +208,7 @@ Response: `{ "taskId": "...", "sessionId": "..." }`. With `callbackChannel` the 
 This project is a **trusted remote-execution bridge, not a sandbox**. Treat possession of `WORKER_TOKEN` as near-user-level access to the runner host:
 
 - An authenticated caller can enqueue shell commands, read/write/edit files within the runner's broad allowed roots, and invoke Claude Code, Codex, or Gemini.
-- The command prefix filter rejects some unsupported or obviously hazardous strings, but accepted commands still run as `/bin/zsh -l -c <command>` with the runner user's permissions. Prefix matching is not shell parsing, isolation, or hostile-user authorization.
+- The command prefix filter rejects some unsupported or obviously hazardous strings, but accepted commands still run through the host shell (`SHELL` on Unix, `ComSpec` on Windows) with the runner user's permissions. Prefix matching is not shell parsing, isolation, or hostile-user authorization.
 - The CLI paths intentionally use broad automation modes. A successful prompt injection or stolen bearer token can therefore have a blast radius close to the runner's user account.
 - The runner removes bridge-control secrets (`WORKER_TOKEN`, callback bot tokens, and hook tokens) from shell-command and AI-CLI child environments. This reduces accidental credential exposure; it does not make those child processes sandboxed.
 
@@ -232,6 +235,8 @@ Prefer `setup.sh`, which creates separate task-api and runner files so the callb
 | `CALLBACK_BOT_TOKEN` | task-api | Bot token for posting results back |
 | `CALLBACK_API_BASE_URL` | task-api | Bot API base URL (default: Discord) |
 | `CALLBACK_CHANNEL` | task-api | Optional fallback channel/thread ID when a task has no callback channel |
+| `CLAUDE_PROJECTS_DIR` | Compose + runner | Host Claude projects/session directory. Setup detects `~/.claude/projects`; Compose mounts it read-only |
+| `CODEX_SESSIONS_DIR` | Compose + runner | Host Codex session directory. Setup detects `~/.codex/sessions`; Compose mounts it read-only |
 | `WORKER_URL` | runner | URL to reach task-api (default: `http://localhost:3456`) |
 | `CLAUDE_PATH` | runner | Path to `claude` binary (default: `claude`) |
 | `CODEX_PATH` | runner | Path to `codex` binary (default: `codex`) |
@@ -244,6 +249,7 @@ Prefer `setup.sh`, which creates separate task-api and runner files so the callb
 | `POLL_INTERVAL` | runner | Polling interval when at capacity (default: `500` ms) |
 | `LONG_POLL_WAIT` | runner | Long-poll wait window (default: `30000` ms) |
 | `WORKER_DIRECT_CALLBACK` | runner | Legacy opt-in for runner-side callback delivery. Keep `false` for Windows/cloud setups |
+| `WORKER_SHELL` | runner | Optional shell override. Defaults to `SHELL`/a standard Unix shell or `ComSpec` on Windows |
 | `DISCORD_PROXY` | runner | HTTPS proxy for legacy runner-side callback delivery (optional) |
 
 The tracked `plugin/openclaw.plugin.json` defines only the plugin schema. Runtime values belong under `plugins.entries.cli-bridge.config` in your private OpenClaw config. `setup.sh` generates the correctly shaped, ignored snippet at `.runtime/openclaw-plugin-config.json` with the worker API token and callback channel. The optional `callbackBotToken` schema remains available for legacy/manual deployments, but setup deliberately keeps that token in task-api `.env` and does not copy it to the plugin or runner.
@@ -267,7 +273,7 @@ cd runner
 node --env-file=..\.runtime\runner.env worker.js
 ```
 
-The runner uses `%TEMP%` for the session cache and live log by default on Windows. Leave `WORKER_DIRECT_CALLBACK=false` so Windows only reports results to `task-api`; the server sends the chat callback.
+The runner uses `%TEMP%` for the session cache and live log by default on Windows. Commands use `ComSpec` (normally `cmd.exe`); `WORKER_SHELL` may select a cmd-compatible shell or PowerShell. Leave `WORKER_DIRECT_CALLBACK=false` so Windows only reports results to `task-api`; the server sends the chat callback.
 
 Or register as a systemd service for always-on operation:
 

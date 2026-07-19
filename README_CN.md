@@ -151,7 +151,8 @@ docker-compose up -d
 2. 提示输入端口、Bot Token、回调频道 ID
 3. 生成 256-bit `WORKER_TOKEN`，不在终端显示；分别写入 task-api `.env` 和权限收窄的 `.runtime/runner.env`，两者都被 Git 忽略且权限为 `0600`
 4. 生成权限为 `0600` 的 Git 忽略配置片段 `.runtime/openclaw-plugin-config.json`；callback bot token 只留在 task-api `.env`
-5. 可选安装 macOS LaunchAgent
+5. 自动识别 Claude/Codex 会话目录，以只读方式挂载进 task-api，供最近会话命令使用
+6. 可选安装 macOS LaunchAgent
 
 配置完成后，把 `plugin/` 目录复制到 OpenClaw 插件目录（或在 `openclaw.json` 里引用），再把 `.runtime/openclaw-plugin-config.json` 合并进现有的 OpenClaw 私有配置。受 Git 跟踪的 `plugin/openclaw.plugin.json` 只保留 schema，不再写任何凭证。
 
@@ -164,6 +165,8 @@ docker-compose up -d
 **`runner/`** — 宿主机（或任意机器）上的 Node.js 进程。长轮询 task-api，spawn Claude Code / Codex / Gemini CLI（最多 5 个并发），并把执行结果回传给 task-api。优先使用 Agent SDK（流式输出），失败自动回退到 CLI 模式。
 
 **`plugin/`** — OpenClaw TypeScript 插件。注册 `/cc`、`/codex`、`/gemini` 命令族，管理按频道的 session 绑定（SQLite 持久化），向 task-api 提交任务。
+
+task-api 重启时，如果任务已被 runner 领取，会保留原来的 `running` 状态，不自动重新排队，因为命令可能已经产生副作用。仍在执行的 runner 可以正常回报结果；收不到结果时，应先检查实际影响，再人工提交替代任务。
 
 ---
 
@@ -204,7 +207,7 @@ curl -X POST https://task-api.example.com/claude \
 这个项目是**可信远程执行桥，不是沙箱**。拿到 `WORKER_TOKEN`，就应视为拿到了接近 runner 宿主机当前用户权限的能力：
 
 - 通过认证的调用方可以提交 shell 命令、在 runner 的宽泛允许目录内读写/编辑文件，并调用 Claude Code、Codex 或 Gemini。
-- 命令前缀过滤器会挡住一部分不支持或明显危险的字符串，但通过后仍由 `/bin/zsh -l -c <command>` 以 runner 用户身份解释执行。前缀匹配不是 shell 解析、隔离机制，也不能承担恶意用户鉴权。
+- 命令前缀过滤器会挡住一部分不支持或明显危险的字符串，但通过后仍由宿主机 shell（Unix 使用 `SHELL`，Windows 使用 `ComSpec`）以 runner 用户身份解释执行。前缀匹配不是 shell 解析、隔离机制，也不能承担恶意用户鉴权。
 - 三个 CLI 路径有意使用较宽的自动执行模式。若 prompt injection 成功或 bearer token 被盗，影响范围会接近 runner 用户账号本身。
 - runner 会从 shell 命令和 AI CLI 子进程环境中移除 `WORKER_TOKEN`、callback bot token 和 hook token。这能减少凭证意外暴露，但不等于给子进程加了沙箱。
 
@@ -231,6 +234,8 @@ curl -X POST https://task-api.example.com/claude \
 | `CALLBACK_BOT_TOKEN` | task-api | 用于推送结果的 Bot Token |
 | `CALLBACK_API_BASE_URL` | task-api | Bot API 地址（默认 Discord） |
 | `CALLBACK_CHANNEL` | task-api | 可选兜底频道/子区 ID，任务没有 callbackChannel 时使用 |
+| `CLAUDE_PROJECTS_DIR` | Compose + runner | 宿主机 Claude 项目/会话目录；setup 默认识别 `~/.claude/projects`，Compose 只读挂载 |
+| `CODEX_SESSIONS_DIR` | Compose + runner | 宿主机 Codex 会话目录；setup 默认识别 `~/.codex/sessions`，Compose 只读挂载 |
 | `WORKER_URL` | runner | task-api 地址（默认 `http://localhost:3456`） |
 | `CLAUDE_PATH` | runner | `claude` 二进制路径（默认 `claude`） |
 | `CODEX_PATH` | runner | `codex` 二进制路径（默认 `codex`） |
@@ -243,6 +248,7 @@ curl -X POST https://task-api.example.com/claude \
 | `POLL_INTERVAL` | runner | 并发满时轮询间隔（默认 `500` ms） |
 | `LONG_POLL_WAIT` | runner | 长轮询等待窗口（默认 `30000` ms） |
 | `WORKER_DIRECT_CALLBACK` | runner | 旧路径开关：是否让 runner 直接调用 callback API。Windows / 云端部署保持 `false` |
+| `WORKER_SHELL` | runner | 可选 shell 覆盖；默认使用 `SHELL`/标准 Unix shell，Windows 使用 `ComSpec` |
 | `DISCORD_PROXY` | runner | 旧路径的 HTTPS 代理（可选） |
 
 受 Git 跟踪的 `plugin/openclaw.plugin.json` 只定义 schema。运行时配置应放在私有 OpenClaw 配置的 `plugins.entries.cli-bridge.config` 下。`setup.sh` 生成的 `.runtime/openclaw-plugin-config.json` 只含 worker API token 与 callback channel。schema 仍保留可选 `callbackBotToken` 供旧版/手工部署使用，但 setup 不会把它复制到 plugin 或 runner。
@@ -266,7 +272,7 @@ cd runner
 node --env-file=..\.runtime\runner.env worker.js
 ```
 
-runner 在 Windows 上默认用 `%TEMP%` 保存 session cache 和 live log。保持 `WORKER_DIRECT_CALLBACK=false`，让 Windows 只把结果回传给 task-api，由服务端负责推送聊天 callback。
+runner 在 Windows 上默认用 `%TEMP%` 保存 session cache 和 live log。命令默认由 `ComSpec`（通常是 `cmd.exe`）执行，也可用 `WORKER_SHELL` 选择 cmd 兼容 shell 或 PowerShell。保持 `WORKER_DIRECT_CALLBACK=false`，让 Windows 只把结果回传给 task-api，由服务端负责推送聊天 callback。
 
 或配 systemd 持久运行：
 

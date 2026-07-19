@@ -2,6 +2,7 @@
 
 import { randomBytes } from 'node:crypto';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -35,6 +36,16 @@ function writePrivateFile(filePath, content) {
   fs.chmodSync(filePath, 0o600);
 }
 
+function sessionDirectory(name, defaultPath) {
+  const configured = value(name).trim();
+  if (configured) return path.resolve(configured);
+  if (fs.existsSync(defaultPath)) return defaultPath;
+
+  const emptyMount = path.join(runtimeDir, `empty-${name.toLowerCase().replaceAll('_', '-')}`);
+  fs.mkdirSync(emptyMount, { recursive: true, mode: 0o700 });
+  return emptyMount;
+}
+
 function main() {
   const port = value('PORT', '3456').trim();
   const portNumber = Number.parseInt(port, 10);
@@ -48,6 +59,9 @@ function main() {
   const taskApiBind = value('TASK_API_BIND', '127.0.0.1').trim() || '127.0.0.1';
   const workerUrl = value('WORKER_URL', `http://127.0.0.1:${port}`).trim();
   const pluginApiUrl = value('PLUGIN_API_URL', `http://host.docker.internal:${port}`).trim();
+  const hostHome = value('HOME') || value('USERPROFILE') || os.homedir();
+  const claudeProjectsDir = sessionDirectory('CLAUDE_PROJECTS_DIR', path.join(hostHome, '.claude', 'projects'));
+  const codexSessionsDir = sessionDirectory('CODEX_SESSIONS_DIR', path.join(hostHome, '.codex', 'sessions'));
 
   const taskApiEnvValues = {
     WORKER_TOKEN: workerToken,
@@ -56,6 +70,8 @@ function main() {
     CALLBACK_BOT_TOKEN: callbackBotToken,
     CALLBACK_API_BASE_URL: value('CALLBACK_API_BASE_URL', 'https://discord.com/api/v10'),
     CALLBACK_CHANNEL: callbackChannel,
+    CLAUDE_PROJECTS_DIR: claudeProjectsDir,
+    CODEX_SESSIONS_DIR: codexSessionsDir,
   };
   const runnerEnvValues = {
     WORKER_TOKEN: workerToken,
@@ -68,6 +84,9 @@ function main() {
     RUNNER_SESSION_CACHE_FILE: value('RUNNER_SESSION_CACHE_FILE'),
     CC_LOG_PATH: value('CC_LOG_PATH'),
     WORKER_DIRECT_CALLBACK: value('WORKER_DIRECT_CALLBACK', 'false'),
+    WORKER_SHELL: value('WORKER_SHELL'),
+    CLAUDE_PROJECTS_DIR: claudeProjectsDir,
+    CODEX_SESSIONS_DIR: codexSessionsDir,
   };
 
   const taskApiEnvContent = [

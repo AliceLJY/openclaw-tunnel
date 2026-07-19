@@ -420,9 +420,8 @@ function cleanupExpiredSessions() {
   return deleted;
 }
 
-function resetStaleRunningTasks() {
+function preserveRunningTasksOnStartup() {
   const db = getTaskDb();
-  const now = Date.now();
   const staleRows = db.prepare(`
     SELECT id, payload_json
     FROM tasks
@@ -430,18 +429,22 @@ function resetStaleRunningTasks() {
   `).all();
 
   for (const row of staleRows) {
+    const payload = safeParseJson(row.payload_json, {});
     const task = hydrateTaskRow({
       ...row,
-      type: safeParseJson(row.payload_json, {}).type || 'command',
+      type: payload.type || 'command',
       status: 'running',
-      created_at: safeParseJson(row.payload_json, {}).createdAt || now,
-      started_at: safeParseJson(row.payload_json, {}).startedAt || null,
+      created_at: payload.createdAt || Date.now(),
+      started_at: payload.startedAt || null,
       completed_at: null,
     });
     if (!task) continue;
-    task.status = 'pending';
-    task.startedAt = null;
-    saveTask(task);
+    // A task may still be executing in a runner that survived the task-api restart.
+    // Preserve the claim so commands with side effects are never run a second time
+    // automatically. A late worker result can still complete this task normally.
+    appendEvent('task.recovery-preserved', task, {
+      details: { reason: 'task-api restarted while task was claimed' },
+    });
   }
 
   return staleRows.length;
@@ -1553,7 +1556,7 @@ process.on('uncaughtException', (err) => {
 
 // ========== Startup ==========
 app.listen(PORT, '0.0.0.0', () => {
-  const requeued = resetStaleRunningTasks();
+  const preserved = preserveRunningTasksOnStartup();
   const queue = getQueueStats();
   trimEvents();
   console.log(`✅ Task API running on :${PORT}`);
@@ -1561,7 +1564,7 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`   Notify: ${CALLBACK_BOT_TOKEN ? '✓ CALLBACK_BOT_TOKEN/DISCORD_BOT_TOKEN set' : '✗ no CALLBACK_BOT_TOKEN or DISCORD_BOT_TOKEN'}`);
   console.log(`   Tasks : ${TASK_DB_PATH} | total=${queue.total} | results=${queue.unconsumedResults}`);
   console.log(`   Events: ${EVENT_DB_PATH} | retention=${EVENT_RETENTION_DAYS}d | max=${MAX_EVENTS}`);
-  if (requeued > 0) {
-    console.log(`   Requeue: reset ${requeued} stale running task(s) to pending`);
+  if (preserved > 0) {
+    console.log(`   Recovery: preserved ${preserved} claimed task(s); verify effects before resubmitting`);
   }
 });
