@@ -4,7 +4,7 @@
 
 **随时随地运行 AI 编程 Agent — Docker、云端、混合部署**
 
-*基于带认证的 HTTP(S) 任务队列，让 OpenClaw 跨容器边界、跨网络边界调度 Claude Code、Codex 和 Gemini CLI。*
+*基于带认证的 HTTP(S) 任务队列，让 OpenClaw 跨容器边界、跨网络边界调度 Claude Code 和 Codex。*
 
 [![MIT License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Node.js](https://img.shields.io/badge/Node.js-≥22.5-339933?logo=node.js)](https://nodejs.org)
@@ -19,6 +19,12 @@
 > **状态：维护模式。** 作者自己的部署里，OpenClaw 插件的 slash 命令路径已退役；
 > 当前在用的是容器通过本机/私有网络直接调用 task-api（见下方“两种接入方式”）。
 > 插件本身仍可用，对 OpenClaw 用户仍是推荐入口。
+
+> **关于 Gemini 这条路。** Google 已于 2026-06-18 对个人账号（免费 / AI Pro / AI Ultra）
+> 停止 `gemini` CLI 服务，继任者是 Antigravity CLI（`agy`），本 runner 不 spawn 它。
+> `/gemini` 命令族与 `GEMINI_PATH` 保留给仍持有可用旧二进制的 Code Assist
+> Standard/Enterprise 用户——个人账号上这条路已经无法完成认证。
+> Claude Code 与 Codex 不受影响。
 
 ---
 
@@ -125,7 +131,7 @@ WORKER_URL=http://localhost:3456
 
 | 特性 | 说明 |
 |------|------|
-| **三个 CLI** | `/cc` Claude Code、`/codex` Codex、`/gemini` Gemini |
+| **多个 CLI** | `/cc` Claude Code、`/codex` Codex。另有 `/gemini` 命令族，状态见上方 Gemini 说明 |
 | **会话延续** | 按频道自动续接，绑定持久化到 SQLite |
 | **零 token 中转** | 纯协议层，不消耗 OpenClaw token 配额 |
 | **平台无关** | Discord、Telegram 或任何 OpenClaw 支持的平台 |
@@ -239,7 +245,7 @@ curl -X POST https://task-api.example.com/claude \
 | `WORKER_URL` | runner | task-api 地址（默认 `http://localhost:3456`） |
 | `CLAUDE_PATH` | runner | `claude` 二进制路径（默认 `claude`） |
 | `CODEX_PATH` | runner | `codex` 二进制路径（默认 `codex`） |
-| `GEMINI_PATH` | runner | `gemini` 二进制路径（默认 `gemini`） |
+| `GEMINI_PATH` | runner | `gemini` 二进制路径（默认 `gemini`）。遗留项，见上方 Gemini 说明 |
 | `CC_TIMEOUT` | runner | 任务未自带 timeout 时的兜底执行上限（默认 `1200000` ms） |
 | `CC_MODELS` | runner | 可选 Claude 模型列表，逗号分隔。留空表示使用 Claude Code 默认模型 |
 | `RUNNER_SESSION_CACHE_FILE` | runner | 可选 session cache 路径。留空使用系统临时目录 |
@@ -306,7 +312,7 @@ runner 在宿主机或远程机器上，可能在 NAT 后面，task-api 没法�
 
 - Docker（已运行，含 Docker Compose）
 - Node.js >= 22.5（runner 用了 `node:sqlite` 内置模块）
-- 至少安装一个 CLI 并完成认证：Claude Code、Codex 或 Gemini
+- 至少安装一个 CLI 并完成认证：Claude Code 或 Codex
 - OpenClaw 实例（Docker 部署）
 
 </details>
@@ -317,7 +323,7 @@ runner 在宿主机或远程机器上，可能在 NAT 后面，task-api 没法�
 
 [AliceLJY](https://github.com/AliceLJY) — 不是程序员，用 Claude Code 搭 AI Agent 基础设施的野路子玩家。公众号「我的AI小木屋」记录折腾过程。
 
-这个项目来自真实的痛：五个 OpenClaw bot 跑在 Docker 里，Claude Code / Codex / Gemini 在宿主机上，中间隔着容器边界。
+这个项目来自真实的痛：五个 OpenClaw bot 跑在 Docker 里，Claude Code / Codex /（当时的）Gemini CLI 在宿主机上，中间隔着容器边界。
 
 ## 许可证
 

@@ -4,7 +4,7 @@
 
 **Run AI Coding Agents from Anywhere — Docker, Cloud, or Hybrid**
 
-*An authenticated HTTP(S) task-queue bridge that lets OpenClaw dispatch tasks to Claude Code, Codex, and Gemini CLI across container boundaries, network boundaries, or both.*
+*An authenticated HTTP(S) task-queue bridge that lets OpenClaw dispatch tasks to Claude Code and Codex across container boundaries, network boundaries, or both.*
 
 [![MIT License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Node.js](https://img.shields.io/badge/Node.js-≥22.5-339933?logo=node.js)](https://nodejs.org)
@@ -20,6 +20,13 @@
 > retired; the live path is now containers calling `task-api` directly over a local/private network
 > (see "Two Ways to Connect" below). The plugin still works and remains the recommended entry point
 > for OpenClaw users.
+
+> **On the Gemini path.** Google retired the standalone `gemini` CLI for personal
+> accounts (free, AI Pro, AI Ultra) on 2026-06-18; its successor is the Antigravity
+> CLI (`agy`), which this runner does not spawn. The `/gemini` command family and
+> `GEMINI_PATH` are kept for Code Assist Standard/Enterprise users who still have a
+> working legacy binary — on a personal account that path can no longer authenticate.
+> Claude Code and Codex are unaffected.
 
 ---
 
@@ -126,7 +133,7 @@ WORKER_URL=http://localhost:3456
 
 | Feature | Description |
 |---------|-------------|
-| **Three CLIs** | `/cc` for Claude Code, `/codex` for Codex, `/gemini` for Gemini |
+| **Multiple CLIs** | `/cc` for Claude Code, `/codex` for Codex. A `/gemini` family also ships, but see the Gemini note above |
 | **Session continuity** | Per-channel sessions with auto-resume. Bindings persisted in SQLite |
 | **Zero-token relay** | Protocol layer only — no LLM calls in the plugin or runner |
 | **Platform agnostic** | Discord, Telegram, or any platform OpenClaw supports |
@@ -240,7 +247,7 @@ Prefer `setup.sh`, which creates separate task-api and runner files so the callb
 | `WORKER_URL` | runner | URL to reach task-api (default: `http://localhost:3456`) |
 | `CLAUDE_PATH` | runner | Path to `claude` binary (default: `claude`) |
 | `CODEX_PATH` | runner | Path to `codex` binary (default: `codex`) |
-| `GEMINI_PATH` | runner | Path to `gemini` binary (default: `gemini`) |
+| `GEMINI_PATH` | runner | Path to `gemini` binary (default: `gemini`). Legacy — see the Gemini note above |
 | `CC_TIMEOUT` | runner | Fallback per-task execution cap when a task omits its own timeout, in ms (default: `1200000`) |
 | `CC_MODELS` | runner | Optional comma-separated Claude model list. Empty means use Claude Code's default model |
 | `RUNNER_SESSION_CACHE_FILE` | runner | Optional session cache path. Empty uses the OS temp directory |
@@ -307,7 +314,7 @@ The runner sits on the host (or a remote machine) behind NAT — `task-api` insi
 
 - Docker (with Docker Compose)
 - Node.js >= 22.5 (required for `node:sqlite` built-in)
-- At least one CLI installed and authenticated: Claude Code, Codex, or Gemini
+- At least one CLI installed and authenticated: Claude Code or Codex
 - OpenClaw instance (Docker deployment)
 
 </details>
@@ -318,7 +325,7 @@ The runner sits on the host (or a remote machine) behind NAT — `task-api` insi
 
 Built by [AliceLJY](https://github.com/AliceLJY) — a non-programmer who builds AI agent infrastructure with Claude Code. Writes about the journey on WeChat: "My AI Cabin".
 
-This project grew out of real-world pain: running five OpenClaw bots in Docker while needing Claude Code, Codex, and Gemini on the host.
+This project grew out of real-world pain: running five OpenClaw bots in Docker while needing Claude Code, Codex, and (at the time) Gemini CLI on the host.
 
 ## Ecosystem
 
@@ -328,7 +335,7 @@ Part of the **小试AI** open-source AI workflow:
 |---------|-------------|
 | [recallnest](https://github.com/AliceLJY/recallnest) | MCP memory workbench (LanceDB + Jina v5) |
 | [digital-clone-skill](https://github.com/AliceLJY/digital-clone-skill) | Build digital clones from corpus data |
-| [telegram-ai-bridge](https://github.com/AliceLJY/telegram-ai-bridge) | Telegram bots for Claude, Codex, and Gemini |
+| [telegram-ai-bridge](https://github.com/AliceLJY/telegram-ai-bridge) | Telegram bots for Claude, Codex, Agy, and Kimi |
 | [claude-code-studio](https://github.com/AliceLJY/claude-code-studio) | Multi-session collaboration platform for Claude Code |
 | [cc-empire](https://github.com/AliceLJY/cc-empire) | Complete Claude Code workflow scaffold |
 
