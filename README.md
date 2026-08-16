@@ -337,7 +337,7 @@ Part of the **小试AI** open-source AI workflow:
 | [digital-clone-skill](https://github.com/AliceLJY/digital-clone-skill) | Build digital clones from corpus data |
 | [telegram-ai-bridge](https://github.com/AliceLJY/telegram-ai-bridge) | Telegram bots for Claude, Codex, Agy, and Kimi |
 | [claude-code-studio](https://github.com/AliceLJY/claude-code-studio) | Multi-session collaboration platform for Claude Code |
-| [cc-empire](https://github.com/AliceLJY/cc-empire) | Complete Claude Code workflow scaffold |
+| cc-empire *(private)* | Complete Claude Code workflow scaffold |
 
 ## License
 
