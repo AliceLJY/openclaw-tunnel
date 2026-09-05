@@ -257,6 +257,26 @@ curl -X POST https://task-api.example.com/claude \
 | `WORKER_SHELL` | runner | 可选 shell 覆盖；默认使用 `SHELL`/标准 Unix shell，Windows 使用 `ComSpec` |
 | `DISCORD_PROXY` | runner | 旧路径的 HTTPS 代理（可选） |
 
+**高级 / 内部变量。** 以下变量直接从 `process.env` 读取，用于内部调优或向后兼容别名，多数部署不需要设置。
+
+| 变量 | 使用位置 | 说明 |
+|------|---------|------|
+| `WORKER_PORT` | task-api | `PORT` 的备用名，仅在 `PORT` 未设置时生效（默认 `3456`） |
+| `WORKER_MAX_EVENTS` | task-api | 内存中事件日志的最大条数（默认 `2000`；范围 `100`–`500000`） |
+| `WORKER_EVENT_RETENTION_DAYS` | task-api | 事件日志保留天数（默认 `14`；范围 `1`–`3650`） |
+| `WORKER_EVENT_DB` | task-api | 事件日志 SQLite 数据库路径（默认 `/data/events.db`） |
+| `WORKER_TASK_DB` | task-api | 任务 SQLite 数据库路径（默认 `/data/tasks.db`） |
+| `WORKER_TASK_RETENTION_MS` | task-api | 任务记录完成后的保留时长，单位 ms（默认 `3600000`；范围 `60000`–`604800000`） |
+| `WORKER_RESULT_RETENTION_MS` | task-api | 任务结果的保留时长，单位 ms（默认 `1800000`；范围 `60000`–`604800000`） |
+| `WORKER_SESSION_RETENTION_MS` | task-api | runner 会话记录的保留时长，单位 ms（默认 `1800000`；范围 `60000`–`2592000000`） |
+| `DISCORD_API_BASE_URL` | task-api | `CALLBACK_API_BASE_URL` 的兼容别名 |
+| `DISCORD_BOT_TOKEN` | task-api | `CALLBACK_BOT_TOKEN` 的兼容别名 |
+| `DEFAULT_CALLBACK_CHANNEL` | task-api | `CALLBACK_CHANNEL` 的兼容别名 |
+| `CC_MODEL` | runner | `CC_MODELS` 的单数兼容别名，仅在 `CC_MODELS` 未设置时生效 |
+| `GEMINI_REPLY_HINT` | runner | 追加在 Gemini 回复末尾的可选提示文本。遗留项，见上方 Gemini 说明 |
+| `CLI_BRIDGE_SESSION_STORE` | plugin | 覆盖 plugin 会话存储数据库路径（默认 `~/.openclaw-cli-bridge/state.db`） |
+| `OPENCLAW_TUNNEL_ROOT` | `scripts/write-runtime-config.mjs` | 覆盖生成运行时配置时使用的仓库根路径（默认脚本所在目录的上一级） |
+
 受 Git 跟踪的 `plugin/openclaw.plugin.json` 只定义 schema。运行时配置应放在私有 OpenClaw 配置的 `plugins.entries.cli-bridge.config` 下。`setup.sh` 生成的 `.runtime/openclaw-plugin-config.json` 只含 worker API token 与 callback channel。schema 仍保留可选 `callbackBotToken` 供旧版/手工部署使用，但 setup 不会把它复制到 plugin 或 runner。
 
 </details>
@@ -324,6 +344,18 @@ runner 在宿主机或远程机器上，可能在 NAT 后面，task-api 没法�
 [AliceLJY](https://github.com/AliceLJY) — 不是程序员，用 Claude Code 搭 AI Agent 基础设施的野路子玩家。公众号「我的AI小木屋」记录折腾过程。
 
 这个项目来自真实的痛：五个 OpenClaw bot 跑在 Docker 里，Claude Code / Codex /（当时的）Gemini CLI 在宿主机上，中间隔着容器边界。
+
+## 生态
+
+**小试AI** 开源 AI 工作流的一部分：
+
+| 项目 | 说明 |
+|---------|-------------|
+| [recallnest](https://github.com/AliceLJY/recallnest) | MCP 记忆工作台（LanceDB + Jina v5） |
+| [digital-clone-skill](https://github.com/AliceLJY/digital-clone-skill) | 用语料数据构建数字分身 |
+| [telegram-ai-bridge](https://github.com/AliceLJY/telegram-ai-bridge) | 面向 Claude、Codex、Agy、Kimi 的 Telegram bot |
+| [claude-code-studio](https://github.com/AliceLJY/claude-code-studio) | Claude Code 多会话协作平台 |
+| cc-empire *(private)* | 完整的 Claude Code 工作流脚手架 |
 
 ## 许可证
 

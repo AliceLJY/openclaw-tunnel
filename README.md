@@ -259,6 +259,26 @@ Prefer `setup.sh`, which creates separate task-api and runner files so the callb
 | `WORKER_SHELL` | runner | Optional shell override. Defaults to `SHELL`/a standard Unix shell or `ComSpec` on Windows |
 | `DISCORD_PROXY` | runner | HTTPS proxy for legacy runner-side callback delivery (optional) |
 
+**Advanced / internal.** These are read directly from `process.env` for internal tuning or backward-compat aliasing; most deployments won't need to set them.
+
+| Variable | Where used | Description |
+|---|---|---|
+| `WORKER_PORT` | task-api | Alternate name for `PORT`, used only if `PORT` is unset (default: `3456`) |
+| `WORKER_MAX_EVENTS` | task-api | Max in-memory event log entries (default: `2000`; range `100`–`500000`) |
+| `WORKER_EVENT_RETENTION_DAYS` | task-api | Days to retain event log entries (default: `14`; range `1`–`3650`) |
+| `WORKER_EVENT_DB` | task-api | Path to the event log SQLite database (default: `/data/events.db`) |
+| `WORKER_TASK_DB` | task-api | Path to the task SQLite database (default: `/data/tasks.db`) |
+| `WORKER_TASK_RETENTION_MS` | task-api | How long a finished task record is kept before expiry, in ms (default: `3600000`; range `60000`–`604800000`) |
+| `WORKER_RESULT_RETENTION_MS` | task-api | How long a task result is kept before expiry, in ms (default: `1800000`; range `60000`–`604800000`) |
+| `WORKER_SESSION_RETENTION_MS` | task-api | How long a runner session record is kept before expiry, in ms (default: `1800000`; range `60000`–`2592000000`) |
+| `DISCORD_API_BASE_URL` | task-api | Legacy alias for `CALLBACK_API_BASE_URL` |
+| `DISCORD_BOT_TOKEN` | task-api | Legacy alias for `CALLBACK_BOT_TOKEN` |
+| `DEFAULT_CALLBACK_CHANNEL` | task-api | Legacy alias for `CALLBACK_CHANNEL` |
+| `CC_MODEL` | runner | Legacy singular alias for `CC_MODELS`, used only if `CC_MODELS` is unset |
+| `GEMINI_REPLY_HINT` | runner | Optional hint text appended to Gemini replies. Legacy — see the Gemini note above |
+| `CLI_BRIDGE_SESSION_STORE` | plugin | Override path for the plugin's session-store database (default: `~/.openclaw-cli-bridge/state.db`) |
+| `OPENCLAW_TUNNEL_ROOT` | `scripts/write-runtime-config.mjs` | Override repo-root path used when generating runtime config (default: the parent of the script directory) |
+
 The tracked `plugin/openclaw.plugin.json` defines only the plugin schema. Runtime values belong under `plugins.entries.cli-bridge.config` in your private OpenClaw config. `setup.sh` generates the correctly shaped, ignored snippet at `.runtime/openclaw-plugin-config.json` with the worker API token and callback channel. The optional `callbackBotToken` schema remains available for legacy/manual deployments, but setup deliberately keeps that token in task-api `.env` and does not copy it to the plugin or runner.
 
 </details>
