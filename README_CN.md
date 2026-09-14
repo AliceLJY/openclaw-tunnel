@@ -16,9 +16,9 @@
 
 ---
 
-> **状态：维护模式。** 作者自己的部署里，OpenClaw 插件的 slash 命令路径已退役；
-> 当前在用的是容器通过本机/私有网络直接调用 task-api（见下方“两种接入方式”）。
-> 插件本身仍可用，对 OpenClaw 用户仍是推荐入口。
+> **已于 2026-09-14 退役。** 本项目停止维护。作者使用的 OpenClaw/Discord bot 部署、Docker 运行环境、task-api 与 runner 均已撤除。本仓库归档后仅保留历史参考；下方部署说明描述的是旧系统，不代表仍受支持的在线服务。
+>
+> 独立维护的 [telegram-ai-bridge](https://github.com/AliceLJY/telegram-ai-bridge) 继续运行，不依赖这套 OpenClaw/Docker 部署。
 
 > **关于 Gemini 这条路。** Google 已于 2026-06-18 对个人账号（免费 / AI Pro / AI Ultra）
 > 停止 `gemini` CLI 服务，继任者是 Antigravity CLI（`agy`），本 runner 不 spawn 它。

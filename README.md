@@ -16,10 +16,9 @@
 
 ---
 
-> **Status: Maintenance mode.** In the author's own setup the OpenClaw plugin's slash-command path is
-> retired; the live path is now containers calling `task-api` directly over a local/private network
-> (see "Two Ways to Connect" below). The plugin still works and remains the recommended entry point
-> for OpenClaw users.
+> **Retired on 2026-09-14.** This project is no longer maintained. The author's OpenClaw/Discord bot deployment, Docker runtime, task API, and runner have been removed. This repository is preserved as a read-only historical reference; the setup instructions below describe the former system, not a supported live service.
+>
+> The separately maintained [telegram-ai-bridge](https://github.com/AliceLJY/telegram-ai-bridge) continues to operate without this OpenClaw/Docker deployment.
 
 > **On the Gemini path.** Google retired the standalone `gemini` CLI for personal
 > accounts (free, AI Pro, AI Ultra) on 2026-06-18; its successor is the Antigravity
